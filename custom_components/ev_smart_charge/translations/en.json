@@ -1,0 +1,83 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "EV Smart Charge Setup",
+        "description": "Configure your EV charging optimiser. Prices are fetched from AgilePredict ({api_url}) — a free ML-based Octopus Agile price predictor for UK customers.",
+        "data": {
+          "name": "Integration name",
+          "region": "UK DNO region (Agile pricing area)",
+          "battery_capacity": "EV battery capacity (kWh)",
+          "charge_rate": "Charger rate (kW)",
+          "target_soc": "Target state of charge (%)",
+          "min_soc": "Minimum acceptable SOC (%) — never drop below this",
+          "departure_time": "Departure time (HH:MM, 24-hour)",
+          "soc_entity": "Home Assistant entity for current battery SOC (optional)",
+          "charger_switch": "Home Assistant switch entity for EV charger (optional)"
+        },
+        "data_description": {
+          "region": "Find your region from your electricity bill MPAN (digits 9–10) or the Octopus Energy website.",
+          "battery_capacity": "Total usable capacity of your EV battery in kWh.",
+          "charge_rate": "Maximum AC charge rate of your home charger in kW.",
+          "target_soc": "The SOC percentage to charge to during normal sessions.",
+          "min_soc": "If battery drops to this level, charging starts immediately regardless of price.",
+          "departure_time": "The integration will ensure charging completes before this time each day.",
+          "soc_entity": "e.g. sensor.my_car_battery_level — used for historical analysis and live decisions.",
+          "charger_switch": "e.g. switch.ev_charger — if set, the integration can control charging automatically."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not connect to AgilePredict API. Check your internet connection and try again.",
+      "invalid_time_format": "Departure time must be in HH:MM 24-hour format (e.g. 07:30).",
+      "min_soc_too_high": "Minimum SOC must be lower than the target SOC."
+    },
+    "abort": {
+      "already_configured": "This integration is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "EV Smart Charge Options",
+        "data": {
+          "target_soc": "Target state of charge (%)",
+          "min_soc": "Minimum acceptable SOC (%)",
+          "departure_time": "Departure time (HH:MM)",
+          "soc_entity": "Battery SOC entity",
+          "charger_switch": "Charger switch entity",
+          "scan_interval": "Update interval (seconds)"
+        }
+      }
+    },
+    "error": {
+      "invalid_time_format": "Departure time must be in HH:MM format.",
+      "min_soc_too_high": "Minimum SOC must be lower than the target SOC."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "strategy": {
+        "name": "Charging Strategy",
+        "state": {
+          "charge_tonight": "Charge tonight",
+          "charge_full_tonight": "Charge full tonight",
+          "wait_for_cheaper": "Wait for cheaper prices",
+          "minimum_charge_now": "Minimum charge now",
+          "no_charge_needed": "No charge needed"
+        }
+      },
+      "charge_start": {"name": "Charge Window Start"},
+      "charge_end": {"name": "Charge Window End"},
+      "estimated_charge_cost": {"name": "Estimated Charge Cost"},
+      "cheapest_price_tonight": {"name": "Cheapest Price Tonight"},
+      "forecast_lowest_price": {"name": "Forecast Lowest Price (14 days)"},
+      "forecast_lowest_price_time": {"name": "Forecast Lowest Price Time"},
+      "current_price": {"name": "Current Agile Price"},
+      "estimated_daily_usage": {"name": "Estimated Daily Usage"}
+    },
+    "binary_sensor": {
+      "charge_now": {"name": "Charge Now"}
+    }
+  }
+}

@@ -1,17 +1,21 @@
-# EV Charge Optimizer for Home Assistant
+# EVCharge — Home Assistant Integrations
 
-A custom Home Assistant integration that uses the [AgilePredict](https://agilepredict.com) API to give you intelligent, forward-looking recommendations on **when to charge your EV** on an Octopus Agile tariff.
+Two Home Assistant custom integrations for intelligently charging your EV on the [Octopus Energy Agile](https://octopus.energy/agile/) tariff, powered by [AgilePredict](https://agilepredict.com) 14-day price forecasts.
 
-## How It Works
+---
 
-AgilePredict forecasts Octopus Agile electricity prices **up to 14 days ahead** (updated 4x per day). This integration fetches that forecast and computes whether you should:
+## EV Charge Optimizer (`ev_charge_optimizer`)
 
-| Recommendation | Meaning |
+Uses the 14-day price forecast to dynamically recommend **when and how much** to charge, taking into account upcoming expensive periods across the full two-week window.
+
+### Recommendations
+
+| State | Meaning |
 |---|---|
-| `charge_now_fully` | Prices are cheap **and** a long expensive period is coming — charge to your target % now |
-| `charge_daily` | Prices are consistently low — just charge what you need each day during the cheapest window |
-| `wait` | Current price is high but a cheap window is coming within a few hours — your battery has enough range to wait |
-| `charge_now_minimum` | Battery is low or prices won't improve soon — charge to the minimum safety level now |
+| `charge_now_fully` | Prices are cheap now and a long expensive period is coming — charge to target % now |
+| `charge_daily` | Prices are consistently reasonable — charge what you need each day during cheapest windows |
+| `wait` | Current price is high but a cheap window is coming soon — battery has enough range to wait |
+| `charge_now_minimum` | Battery is low or prices won't improve — charge to minimum safety level now |
 
 ### Decision Logic
 
@@ -26,40 +30,104 @@ AgilePredict forecasts Octopus Agile electricity prices **up to 14 days ahead** 
 8. Default                               →  charge_daily
 ```
 
-Thresholds are based on **percentiles of the 14-day forecast**, so they adapt as the market changes. If the next two weeks are uniformly expensive, the bands shift accordingly.
+Thresholds are percentile-based on the 14-day forecast — they shift as market prices change.
 
-## Installation
+### Installation via HACS
 
-### HACS (recommended)
-
-1. Add this repo as a custom HACS repository (Integration type)
+1. Add this repo as a custom HACS repository (Integration category)
 2. Install **EV Charge Optimizer**
 3. Restart Home Assistant
-4. Go to **Settings > Devices & Services > Add Integration** and search for *EV Charge Optimizer*
+4. **Settings > Devices & Services > Add Integration** → search *EV Charge Optimizer*
 
-### Manual
+### Manual Installation
 
-1. Copy `custom_components/ev_charge_optimizer/` into your HA `config/custom_components/` directory
-2. Restart Home Assistant
-3. Add via **Settings > Devices & Services**
+Copy `custom_components/ev_charge_optimizer/` into your HA `config/custom_components/` directory and restart.
 
-## Configuration
-
-During setup you will be asked for:
+### Configuration
 
 | Field | Description | Example |
 |---|---|---|
-| **Region** | Your Octopus DNO region code | `G` - North Western England |
+| **Region** | Octopus DNO region code | `G` - North Western England |
 | **Battery capacity (kWh)** | Total usable battery | `77` |
 | **Daily usage (kWh)** | Average kWh used per day | `15` |
-| **Charger power (kW)** | Your wallbox/EVSE rating | `7.4` |
+| **Charger power (kW)** | Wallbox/EVSE rating | `7.4` |
 | **Minimum battery %** | Lowest acceptable charge | `20` |
-| **Target charge %** | Charge ceiling (80% for longevity) | `80` |
+| **Target charge %** | Charge ceiling | `80` |
 | **Battery sensor** | HA entity reporting current % (optional) | `sensor.my_car_battery` |
-| **Cheap percentile** | Prices below this percentile = "cheap" | `30` |
-| **Expensive percentile** | Prices above this percentile = "expensive" | `70` |
+| **Cheap percentile** | Prices below this = cheap | `30` |
+| **Expensive percentile** | Prices above this = expensive | `70` |
 
-### Region Codes
+### Entities
+
+**Sensors:** recommendation, reason, current price, 14-day average, cheap/expensive thresholds, next cheap window, battery %, kWh needed, cost now, cost at cheapest, estimated savings, days of range, % expensive next 7 days, cheapest today, cheapest upcoming, longest expensive run ahead.
+
+**Binary Sensors:** `charge_ev_now`, `cheap_electricity_period`, `expensive_electricity_period`
+
+---
+
+## EV Smart Charge (`ev_smart_charge`)
+
+A nightly scheduling integration that finds the **cheapest consecutive window** before your departure time and can defer charging to a cheaper night if one is coming soon.
+
+### Strategies
+
+| Strategy | When used |
+|---|---|
+| `no_charge_needed` | Already at or above target SOC |
+| `minimum_charge_now` | Battery at or below minimum — charges immediately |
+| `charge_full_tonight` | Tonight is ≥20% cheaper than the next 7-night average |
+| `wait_for_cheaper` | A night within 3 days is ≥10% cheaper and battery will last |
+| `charge_tonight` | Default — charges during cheapest slots before departure |
+
+### Installation via HACS
+
+1. Add this repo as a custom HACS repository (Integration category)
+2. Install **EV Smart Charge**
+3. Restart Home Assistant
+4. **Settings > Devices & Services > Add Integration** → search *EV Smart Charge*
+
+### Manual Installation
+
+Copy `custom_components/ev_smart_charge/` into your HA `config/custom_components/` directory and restart.
+
+### Configuration
+
+| Field | Description |
+|---|---|
+| **Region** | UK DNO region letter (A–P) |
+| **Battery capacity (kWh)** | Total usable capacity |
+| **Charger rate (kW)** | Maximum AC charge rate |
+| **Target SOC %** | Charge level to aim for each night (default 80%) |
+| **Minimum SOC %** | Emergency threshold — charge starts immediately (default 20%) |
+| **Departure time** | HH:MM — charging finishes before this time |
+| **SOC entity** | HA sensor reporting current battery % |
+| **Charger switch** | HA switch entity to control charger (optional) |
+
+### Entities
+
+**Sensors:** charging strategy, charge window start/end, estimated charge cost, cheapest price tonight, 14-day lowest price, current Agile price, estimated daily usage.
+
+**Binary Sensors:** `ev_smart_charge_charge_now` — ON during optimal charging window.
+
+---
+
+## Example Automation (works with either integration)
+
+```yaml
+- alias: "Start EV charging when recommended"
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.charge_ev_now   # or binary_sensor.ev_smart_charge_charge_now
+      to: "on"
+  action:
+    - service: switch.turn_on
+      target:
+        entity_id: switch.ev_charger
+```
+
+---
+
+## Region Codes
 
 | Code | Region | Code | Region |
 |---|---|---|---|
@@ -71,93 +139,8 @@ During setup you will be asked for:
 | F | North Eastern England | N | Southern Scotland |
 | G | North Western England | P | Northern Scotland |
 
-## Entities Created
-
-### Sensors
-
-| Entity | Description | Unit |
-|---|---|---|
-| `sensor.charging_recommendation` | Current strategy | text |
-| `sensor.recommendation_reason` | Human-readable explanation | text |
-| `sensor.current_electricity_price` | Price right now | p/kWh |
-| `sensor.14_day_average_price` | Mean price over forecast | p/kWh |
-| `sensor.cheap_price_threshold` | Upper bound of cheap band | p/kWh |
-| `sensor.expensive_price_threshold` | Lower bound of expensive band | p/kWh |
-| `sensor.next_cheap_window` | Timestamp of next cheap slot | datetime |
-| `sensor.next_cheap_window_price` | Price at next cheap slot | p/kWh |
-| `sensor.hours_until_cheap_window` | Hours until cheap electricity | h |
-| `sensor.ev_battery_level` | Battery % | % |
-| `sensor.energy_needed_to_charge` | kWh to reach target % | kWh |
-| `sensor.hours_to_charge` | How long charging will take | h |
-| `sensor.cost_to_charge_now` | Cost of charging right now | £ |
-| `sensor.cost_at_cheapest_today` | Cost at today's cheapest slot | £ |
-| `sensor.estimated_savings` | Savings from waiting | £ |
-| `sensor.days_of_battery_range` | Days before hitting minimum | days |
-| `sensor.expensive_period_next_7_days` | % of next 7 days that are expensive | % |
-| `sensor.cheapest_price_today` | Lowest forecast price today | p/kWh |
-| `sensor.cheapest_window_today` | When today's cheapest slot starts | datetime |
-| `sensor.cheapest_upcoming_price` | Lowest price in 14-day window | p/kWh |
-| `sensor.cheapest_upcoming_window` | When that slot starts | datetime |
-| `sensor.longest_upcoming_expensive_period` | Longest run of expensive days ahead | days |
-
-### Binary Sensors
-
-| Entity | On when... |
-|---|---|
-| `binary_sensor.charge_ev_now` | Recommendation is to charge now |
-| `binary_sensor.cheap_electricity_period` | Current slot is below cheap threshold |
-| `binary_sensor.expensive_electricity_period` | Current slot is above expensive threshold |
-
-## Example Automations
-
-### Start/stop charger based on recommendation
-
-```yaml
-automation:
-  - alias: "Start EV charging when recommended"
-    trigger:
-      - platform: state
-        entity_id: binary_sensor.charge_ev_now
-        to: "on"
-    action:
-      - service: switch.turn_on
-        target:
-          entity_id: switch.ev_charger
-
-  - alias: "Stop EV charging when not recommended"
-    trigger:
-      - platform: state
-        entity_id: binary_sensor.charge_ev_now
-        to: "off"
-    condition:
-      - condition: state
-        entity_id: sensor.charging_recommendation
-        state: "wait"
-    action:
-      - service: switch.turn_off
-        target:
-          entity_id: switch.ev_charger
-```
-
-### Notification when recommendation changes
-
-```yaml
-automation:
-  - alias: "EV charge recommendation changed"
-    trigger:
-      - platform: state
-        entity_id: sensor.charging_recommendation
-    action:
-      - service: notify.mobile_app
-        data:
-          title: "EV Charging Update"
-          message: >
-            {{ states('sensor.charging_recommendation') | replace('_', ' ') | title }}:
-            {{ state_attr('sensor.charging_recommendation', 'reason') }}
-```
+---
 
 ## Data Source
 
-Forecasts provided by [AgilePredict](https://agilepredict.com) — a machine-learning model trained on BMRS, National Grid ESO, and weather data. Updated at **06:15, 10:15, 16:15, and 22:15** daily.
-
-API: `https://agilepredict.com/api/{REGION}?days=14&high_low=True`
+Forecasts from [AgilePredict](https://agilepredict.com) — ML model trained on BMRS, National Grid ESO, and weather data. Updated at **06:15, 10:15, 16:15, and 22:15** daily. No API key required.
