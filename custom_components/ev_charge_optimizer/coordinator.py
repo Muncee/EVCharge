@@ -347,57 +347,61 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             next_days_avg = (
                 statistics.mean(d["avg"] for d in lookahead) if lookahead else avg_14day
             )
-            # How much more expensive are upcoming days vs today?
             price_ratio = next_days_avg / day["avg"] if day["avg"] > 0 else 1.0
 
             today_is_very_cheap = day["avg"] <= p15
             today_is_cheap = day["avg"] <= p35
-            upcoming_expensive = next_days_avg > avg_14day * 1.08  # upcoming is above avg
+            upcoming_expensive = next_days_avg > avg_14day * 1.08
+
+            # Compute the strategic charge target for this window.
+            # This replaces simple "target_pct or 100%" with a calculation that
+            # considers: how many days until the next cheap window, how expensive
+            # is the gap, and whether today's price justifies charging above target.
+            strategic_target, target_reason = self._strategic_target(
+                day_summaries=day_summaries,
+                from_idx=i,
+                today_overnight_avg=day["avg"],
+                user_target_pct=target_pct,
+                daily_usage=daily_usage,
+                battery_cap=battery_cap,
+                avg_14day=avg_14day,
+                p35=p35,
+            )
 
             # --- Decision ---
             if must_charge:
-                # Battery genuinely running low — must charge
-                # If it's also cheap, charge to full
                 if today_is_cheap and upcoming_expensive and price_ratio >= 1.3:
                     action = ACTION_FULL_CHARGE
-                    charge_to = 100.0
+                    charge_to = strategic_target
                     reason = (
-                        f"Battery needs charging (will reach {safety_pct:.0f}% soon) "
-                        f"AND today is {((1 - day['avg'] / avg_14day) * 100):.0f}% cheaper "
-                        f"than the 14-day average. "
-                        f"Next {len(lookahead)} days average {next_days_avg:.1f}p — "
-                        f"topping up fully while it's cheap."
+                        f"Battery needs charging soon AND today is cheap "
+                        f"({day['avg']:.1f}p, {((1 - day['avg'] / avg_14day) * 100):.0f}% below avg). "
+                        f"{target_reason} — charging to {charge_to:.0f}%."
                     )
                 else:
                     action = ACTION_CHARGE
-                    charge_to = target_pct
+                    charge_to = strategic_target
                     reason = (
                         f"Battery will reach the {safety_pct:.0f}% safety threshold "
-                        f"within the next 2 days — charging to {target_pct:.0f}%."
+                        f"within 2 days. {target_reason} — charging to {charge_to:.0f}%."
                     )
 
             elif today_is_very_cheap and upcoming_expensive and price_ratio >= 1.5 and battery_at_start < 98:
-                # Exceptional price today, expensive week ahead — fully charge
                 action = ACTION_FULL_CHARGE
-                charge_to = 100.0
+                charge_to = strategic_target
                 reason = (
-                    f"Today's prices ({day['avg']:.1f}p avg) are exceptionally cheap — "
-                    f"in the bottom 15% of the next 2 weeks "
-                    f"({((1 - day['avg'] / avg_14day) * 100):.0f}% below the {avg_14day:.1f}p average). "
-                    f"Next {len(lookahead)} days average {next_days_avg:.1f}p "
-                    f"({price_ratio:.1f}x more expensive) — recommended to fully charge now."
+                    f"Exceptionally cheap tonight ({day['avg']:.1f}p — "
+                    f"{((1 - day['avg'] / avg_14day) * 100):.0f}% below the {avg_14day:.1f}p avg). "
+                    f"{target_reason} — charging to {charge_to:.0f}%."
                 )
 
-            elif today_is_cheap and upcoming_expensive and price_ratio >= 1.25 and battery_at_start < (target_pct - 5):
-                # Meaningfully cheaper today, battery below target — top up
+            elif today_is_cheap and upcoming_expensive and price_ratio >= 1.25 and battery_at_start < (strategic_target - 5):
                 action = ACTION_OPPORTUNISTIC
-                charge_to = target_pct
+                charge_to = strategic_target
                 reason = (
-                    f"Good opportunity — today's prices ({day['avg']:.1f}p avg) are "
-                    f"{((1 - day['avg'] / avg_14day) * 100):.0f}% below average "
-                    f"and the next {len(lookahead)} days average {next_days_avg:.1f}p "
-                    f"({price_ratio:.1f}x more expensive). "
-                    f"Charging to {target_pct:.0f}% while it's relatively cheap."
+                    f"Good opportunity — {day['avg']:.1f}p tonight vs {next_days_avg:.1f}p "
+                    f"over the next {len(lookahead)} days ({price_ratio:.1f}x more expensive). "
+                    f"{target_reason} — charging to {charge_to:.0f}%."
                 )
 
             else:
@@ -503,6 +507,102 @@ class EVChargeCoordinator(DataUpdateCoordinator):
 
         all_charge_slots.sort(key=lambda s: s["datetime"])
         return weekly_plan, all_charge_slots
+
+    # ------------------------------------------------------------------
+    # Strategic target calculation
+    # ------------------------------------------------------------------
+
+    def _strategic_target(
+        self,
+        day_summaries: list[dict],
+        from_idx: int,
+        today_overnight_avg: float,
+        user_target_pct: float,
+        daily_usage: float,
+        battery_cap: float,
+        avg_14day: float,
+        p35: float,
+    ) -> tuple[float, str]:
+        """Work out the optimal charge target for a charge window.
+
+        Rather than always using the user's configured target (or always 100%),
+        this looks at the gap until the next cheap window and the price premium
+        during that gap, then sets a target that:
+          - Is never below the user's configured target (that's their floor)
+          - Covers enough energy to reach the next cheap window safely
+          - Goes higher if the gap is long/expensive relative to today's price
+          - Goes to 100% if today is significantly cheaper than the coming gap
+
+        Returns (target_pct, one_line_reason).
+        """
+        depletion_pct_per_day = (daily_usage / battery_cap) * 100
+
+        # Find the next cheap overnight window after today
+        days_gap = None
+        next_cheap_avg = None
+        for j in range(from_idx + 1, len(day_summaries)):
+            d = day_summaries[j]
+            if d["avg"] <= avg_14day * 0.92 or d["avg"] <= p35:
+                days_gap = j - from_idx
+                next_cheap_avg = d["avg"]
+                break
+
+        if days_gap is None:
+            # No cheap window in the 7-day forecast at all
+            days_gap = len(day_summaries) - from_idx
+            next_cheap_avg = avg_14day
+
+        # How expensive is the gap between now and the next cheap window?
+        gap_days_list = day_summaries[from_idx + 1 : from_idx + 1 + days_gap]
+        avg_gap_price = (
+            statistics.mean(d["avg"] for d in gap_days_list)
+            if gap_days_list else avg_14day
+        )
+
+        # Minimum charge needed to reach the next cheap window above safety
+        # Add a 1-day buffer so we arrive with some headroom, not fumes
+        pct_to_bridge = ((days_gap + 1) * depletion_pct_per_day)
+        min_bridge_target = min(100.0, _SAFETY_PCT + pct_to_bridge)
+
+        # Price premium: how much more expensive is the gap vs tonight?
+        gap_premium = avg_gap_price / today_overnight_avg if today_overnight_avg > 0 else 1.0
+
+        # Strategic top-up: the more expensive the gap vs today, the more we charge
+        # Premium ≥ 3×  → fill to 100%  (massive saving opportunity)
+        # Premium ≥ 2×  → fill to 90%   (strong saving)
+        # Premium ≥ 1.5×→ fill to max(bridge, 80%)
+        # Otherwise     → fill to max(bridge, user_target)
+        if gap_premium >= 3.0 or days_gap >= 6:
+            strategic = 100.0
+            reason = (
+                f"Next cheap window in {days_gap} day(s) ({next_cheap_avg:.1f}p avg); "
+                f"gap averages {avg_gap_price:.1f}p ({gap_premium:.1f}x today's price) — "
+                f"filling to 100% to minimise charging during expensive period"
+            )
+        elif gap_premium >= 2.0 or days_gap >= 4:
+            strategic = max(min_bridge_target, 90.0)
+            reason = (
+                f"Next cheap window in {days_gap} day(s) ({next_cheap_avg:.1f}p avg); "
+                f"gap averages {avg_gap_price:.1f}p ({gap_premium:.1f}x tonight) — "
+                f"charging to {strategic:.0f}% to cover the gap cheaply"
+            )
+        elif gap_premium >= 1.5 or days_gap >= 2:
+            strategic = max(min_bridge_target, 80.0)
+            reason = (
+                f"Next cheap window in {days_gap} day(s) ({next_cheap_avg:.1f}p avg); "
+                f"gap averages {avg_gap_price:.1f}p — "
+                f"charging to {strategic:.0f}% to avoid paying peak rates"
+            )
+        else:
+            strategic = max(min_bridge_target, user_target_pct)
+            reason = (
+                f"Next cheap window in {days_gap} day(s) ({next_cheap_avg:.1f}p avg) — "
+                f"charging to {strategic:.0f}% (enough to reach it comfortably)"
+            )
+
+        # Never go below the user's configured target
+        final = max(user_target_pct, strategic)
+        return round(final, 1), reason
 
     # ------------------------------------------------------------------
     # Text generation
