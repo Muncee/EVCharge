@@ -51,6 +51,8 @@ from .const import (
     DATA_NEXT_CHARGE_PRICE,
     DATA_NEXT_CHARGE_TARGET_PCT,
     DATA_SECOND_CHARGE_DATETIME,
+    DATA_NEXT_SCHEDULE_START,
+    DATA_NEXT_SCHEDULE_PRICE,
 )
 from .coordinator import EVChargeCoordinator
 
@@ -268,6 +270,21 @@ SENSOR_DESCRIPTIONS: tuple[EVSensorDescription, ...] = (
         device_class=SensorDeviceClass.TIMESTAMP,
         icon="mdi:calendar-clock-outline",
         data_key=DATA_SECOND_CHARGE_DATETIME,
+    ),
+    EVSensorDescription(
+        key="next_schedule_start",
+        name="Next Scheduled Charge Window",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        icon="mdi:calendar-check",
+        data_key=DATA_NEXT_SCHEDULE_START,
+    ),
+    EVSensorDescription(
+        key="next_schedule_price",
+        name="Next Scheduled Charge Price",
+        native_unit_of_measurement=PENCE_PER_KWH,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:currency-gbp",
+        data_key=DATA_NEXT_SCHEDULE_PRICE,
     ),
 )
 

@@ -57,6 +57,11 @@ from .const import (
     DATA_NEXT_CHARGE_PRICE,
     DATA_NEXT_CHARGE_TARGET_PCT,
     DATA_SECOND_CHARGE_DATETIME,
+    DATA_CHARGE_SCHEDULE,
+    DATA_SCHEDULE_ACTIVE,
+    DATA_NEXT_SCHEDULE_START,
+    DATA_NEXT_SCHEDULE_PRICE,
+    EVENT_PRICES_UPDATED,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -73,8 +78,10 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             update_interval=timedelta(minutes=UPDATE_INTERVAL_MINUTES),
         )
         self.config = config
-        # Runtime overrides set by number entities (min%, target%, daily usage)
+        # Runtime overrides set by number entities (target%, daily usage)
         self.overrides: dict[str, Any] = {}
+        # Track last notification date so we fire once per day after 4:30pm
+        self._last_notification_date: Any = None
 
     async def _async_update_data(self) -> dict[str, Any]:
         region = self.config[CONF_REGION]
@@ -105,7 +112,36 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             raise UpdateFailed("AgilePredict returned no usable price data")
 
         current_battery_pct = self._get_battery_pct()
-        return self._compute_strategy(prices, current_battery_pct)
+        result = self._compute_strategy(prices, current_battery_pct)
+
+        # Fire a HA event once per day at the first update after 16:30 local time.
+        # This aligns with Octopus publishing next-day Agile prices (~4pm).
+        local_now = dt_util.as_local(dt_util.utcnow())
+        if (
+            local_now.hour > 16 or (local_now.hour == 16 and local_now.minute >= 30)
+        ) and self._last_notification_date != local_now.date():
+            self._last_notification_date = local_now.date()
+            self.hass.bus.async_fire(
+                EVENT_PRICES_UPDATED,
+                {
+                    "recommendation": result[DATA_RECOMMENDATION],
+                    "reason": result[DATA_REASON],
+                    "current_price": result[DATA_CURRENT_PRICE],
+                    "next_schedule_start": (
+                        result[DATA_NEXT_SCHEDULE_START].isoformat()
+                        if result[DATA_NEXT_SCHEDULE_START]
+                        else None
+                    ),
+                    "next_schedule_price": result[DATA_NEXT_SCHEDULE_PRICE],
+                },
+            )
+            _LOGGER.info(
+                "ev_charge_optimizer: fired %s — %s",
+                EVENT_PRICES_UPDATED,
+                result[DATA_REASON],
+            )
+
+        return result
 
     # ------------------------------------------------------------------
     # Parsing
@@ -335,7 +371,7 @@ class EVChargeCoordinator(DataUpdateCoordinator):
 
         charge_now_binary = recommendation in (REC_CHARGE_NOW_FULLY, REC_CHARGE_NOW_MINIMUM)
 
-        # Multi-day charge plan
+        # Multi-day charge plan (legacy 2-session)
         next_charge_dt, next_charge_price, next_charge_target, second_charge_dt = (
             self._plan_charge_sessions(
                 prices=prices,
@@ -347,6 +383,21 @@ class EVChargeCoordinator(DataUpdateCoordinator):
                 now=now,
             )
         )
+
+        # Full weekly schedule
+        charge_schedule = self._build_charge_schedule(
+            prices=prices,
+            current_battery_pct=current_battery_pct,
+            target_pct=target_pct,
+            daily_usage=daily_usage,
+            battery_cap=battery_cap,
+            charge_rate=charge_rate,
+            now=now,
+        )
+        # First future window from schedule
+        future_windows = [w for w in charge_schedule if w["end"] > now]
+        active_window = next((w for w in future_windows if w["start"] <= now < w["end"]), None)
+        next_window = next((w for w in future_windows if w["start"] > now), None)
 
         return {
             DATA_RECOMMENDATION: recommendation,
@@ -379,6 +430,10 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             DATA_NEXT_CHARGE_PRICE: next_charge_price,
             DATA_NEXT_CHARGE_TARGET_PCT: next_charge_target,
             DATA_SECOND_CHARGE_DATETIME: second_charge_dt,
+            DATA_CHARGE_SCHEDULE: charge_schedule,
+            DATA_SCHEDULE_ACTIVE: active_window is not None,
+            DATA_NEXT_SCHEDULE_START: next_window["start"] if next_window else None,
+            DATA_NEXT_SCHEDULE_PRICE: round(next_window["price"], 2) if next_window else None,
         }
 
     def _decide_strategy(
@@ -538,6 +593,72 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             second_optimal["datetime"] if second_optimal else None,
         )
 
+    def _build_charge_schedule(
+        self,
+        prices: list[dict],
+        current_battery_pct: float,
+        target_pct: float,
+        daily_usage: float,
+        battery_cap: float,
+        charge_rate: float,
+        now: datetime,
+    ) -> list[dict]:
+        """Build a 7-day charge schedule.
+
+        Returns a list of dicts: {start, end, price, target_pct}.
+        Each entry is a planned charge window. The car is assumed to deplete
+        at daily_usage kWh/day between sessions.
+        """
+        if daily_usage <= 0:
+            return []
+
+        schedule: list[dict] = []
+        battery = current_battery_pct
+        t = now
+        safety_kwh = (self._SAFETY_PCT / 100) * battery_cap
+        target_kwh = (target_pct / 100) * battery_cap
+        horizon = now + timedelta(days=7)
+        future_slots = [s for s in prices if s["datetime"] > now]
+
+        for _ in range(20):  # safety cap on iterations
+            kwh = (battery / 100) * battery_cap
+            usable = max(0.0, kwh - safety_kwh)
+            hours_until_empty = (usable / daily_usage) * 24
+            must_charge_by = t + timedelta(hours=hours_until_empty)
+
+            if must_charge_by > horizon:
+                break  # battery lasts beyond the 7-day window — done
+
+            kwh_needed = max(0.0, target_kwh - max(kwh, safety_kwh))
+            hours_to_charge = max(0.5, kwh_needed / charge_rate) if charge_rate > 0 else 1.0
+            latest_start = must_charge_by - timedelta(hours=hours_to_charge)
+
+            candidates = [s for s in future_slots if t < s["datetime"] <= latest_start]
+            if not candidates:
+                # No room before deadline — take the soonest available slot
+                candidates = [s for s in future_slots if s["datetime"] > t][:8]
+            if not candidates:
+                break
+
+            best = min(candidates, key=lambda x: x["price"])
+            start_dt = best["datetime"]
+            end_dt = start_dt + timedelta(hours=hours_to_charge)
+
+            schedule.append({
+                "start": start_dt,
+                "end": end_dt,
+                "price": best["price"],
+                "target_pct": target_pct,
+            })
+
+            battery = target_pct
+            t = end_dt
+
+            if t >= horizon:
+                break
+
+        return schedule
+
     def _format_wait_time(self, dt: datetime, now: datetime) -> str:
         """Format a future datetime as e.g. 'today at 06:30', 'tomorrow at 14:00', 'Friday at 02:00'."""
         local_dt = dt_util.as_local(dt)
@@ -604,4 +725,8 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             DATA_NEXT_CHARGE_PRICE: None,
             DATA_NEXT_CHARGE_TARGET_PCT: None,
             DATA_SECOND_CHARGE_DATETIME: None,
+            DATA_CHARGE_SCHEDULE: [],
+            DATA_SCHEDULE_ACTIVE: False,
+            DATA_NEXT_SCHEDULE_START: None,
+            DATA_NEXT_SCHEDULE_PRICE: None,
         }

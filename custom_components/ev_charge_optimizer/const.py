@@ -77,3 +77,12 @@ DATA_NEXT_CHARGE_DATETIME = "next_charge_datetime"
 DATA_NEXT_CHARGE_PRICE = "next_charge_price"
 DATA_NEXT_CHARGE_TARGET_PCT = "next_charge_target_pct"
 DATA_SECOND_CHARGE_DATETIME = "second_charge_datetime"
+
+# Weekly charge schedule
+DATA_CHARGE_SCHEDULE = "charge_schedule"        # list of {start, end, price, target_pct}
+DATA_SCHEDULE_ACTIVE = "schedule_charge_active"  # bool — current slot is a scheduled charge window
+DATA_NEXT_SCHEDULE_START = "next_schedule_start" # datetime of next planned charge window
+DATA_NEXT_SCHEDULE_PRICE = "next_schedule_price" # price at that window
+
+# HA event fired when fresh next-day prices are detected (use in automations)
+EVENT_PRICES_UPDATED = "ev_charge_optimizer_prices_updated"
