@@ -13,11 +13,12 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
-    CURRENCY_POUND,
     PERCENTAGE,
     UnitOfEnergy,
     UnitOfTime,
 )
+
+CURRENCY_POUND = "GBP"
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
