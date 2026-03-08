@@ -44,6 +44,8 @@ DATA_NEXT_START = "next_start"               # datetime: start of next charge sl
 DATA_NEXT_END = "next_end"                   # datetime: end of next charge slot
 DATA_SUMMARY = "summary"                     # one-line summary string
 DATA_NOTIFICATION_TEXT = "notification_text" # multi-line schedule for notifications
+DATA_WEEKLY_COST_GBP = "weekly_cost_gbp"     # total estimated charge cost this week
+DATA_WEEKLY_KWH = "weekly_kwh"               # total estimated kWh this week
 
 # HA event fired daily after 16:30 local time when next-day prices arrive
 EVENT_PRICES_UPDATED = "ev_charge_optimizer_prices_updated"

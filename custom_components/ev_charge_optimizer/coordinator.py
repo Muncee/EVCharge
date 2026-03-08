@@ -34,6 +34,8 @@ from .const import (
     DATA_NEXT_END,
     DATA_SUMMARY,
     DATA_NOTIFICATION_TEXT,
+    DATA_WEEKLY_COST_GBP,
+    DATA_WEEKLY_KWH,
     EVENT_PRICES_UPDATED,
 )
 
@@ -210,6 +212,9 @@ class EVChargeCoordinator(DataUpdateCoordinator):
         summary = self._make_summary(weekly_plan, active_slot, now)
         notification_text = self._make_notification_text(weekly_plan, avg_14day, now)
 
+        weekly_cost = round(sum(d.get("charge_cost_gbp", 0) for d in weekly_plan), 2)
+        weekly_kwh = round(sum(d.get("charge_kwh", 0) for d in weekly_plan), 2)
+
         return {
             DATA_CURRENT_PRICE: round(current_price, 2) if current_price is not None else None,
             DATA_AVG_14DAY: round(avg_14day, 2),
@@ -221,6 +226,8 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             DATA_NEXT_END: next_slot["datetime"] + timedelta(minutes=30) if next_slot else None,
             DATA_SUMMARY: summary,
             DATA_NOTIFICATION_TEXT: notification_text,
+            DATA_WEEKLY_COST_GBP: weekly_cost,
+            DATA_WEEKLY_KWH: weekly_kwh,
         }
 
     # ------------------------------------------------------------------
@@ -325,11 +332,33 @@ class EVChargeCoordinator(DataUpdateCoordinator):
                 "min": day_min,
             })
 
-        # Battery simulation
-        safety_pct = _SAFETY_PCT
+        # Two-pass schedule.
+        #
+        # Pass 1 — _build_optimal_schedule():
+        #   Finds every "battery deadline" and assigns the charge to the CHEAPEST
+        #   overnight window before that deadline, not just "the day the alarm trips".
+        #   This fixes the Tuesday-vs-Wednesday bug: if battery hits safety on
+        #   Wednesday but Tuesday overnight is cheaper, we schedule on Tuesday.
+        #
+        # Pass 2 — below:
+        #   Builds the full display plan using the assignments from pass 1, then
+        #   adds cost / kWh / duration data and generates reason text.
+
+        charge_assignments = self._build_optimal_schedule(
+            day_summaries=day_summaries,
+            current_battery_pct=current_battery_pct,
+            target_pct=target_pct,
+            daily_usage=daily_usage,
+            battery_cap=battery_cap,
+            charge_rate=charge_rate,
+            avg_14day=avg_14day,
+            p15=p15,
+            p35=p35,
+        )
+
+        # Pass 2 — build display plan
         kwh_per_slot = charge_rate * 0.5
         depletion_pct_per_day = (daily_usage / battery_cap) * 100
-
         battery = current_battery_pct
         scheduled_dts: set[datetime] = set()
         weekly_plan: list[dict] = []
@@ -337,132 +366,74 @@ class EVChargeCoordinator(DataUpdateCoordinator):
 
         for i, day in enumerate(day_summaries):
             battery_at_start = battery
+            assignment = charge_assignments.get(i)
 
-            # Will battery hit safety within the next ~2 days without charging?
-            battery_in_2_days = battery_at_start - 2 * depletion_pct_per_day
-            must_charge = battery_in_2_days <= safety_pct
+            if assignment:
+                action = assignment["action"]
+                charge_to = assignment["charge_to"]
+                target_reason = assignment["target_reason"]
+                cheapest_day_name = assignment.get("cheapest_day_name", day["date"].strftime("%A"))
+                triggered_by = assignment.get("triggered_by", i)
 
-            # What do the upcoming days look like price-wise?
-            lookahead = day_summaries[i + 1 : i + 6]  # next 5 days
-            next_days_avg = (
-                statistics.mean(d["avg"] for d in lookahead) if lookahead else avg_14day
-            )
-            price_ratio = next_days_avg / day["avg"] if day["avg"] > 0 else 1.0
-
-            today_is_very_cheap = day["avg"] <= p15
-            today_is_cheap = day["avg"] <= p35
-            upcoming_expensive = next_days_avg > avg_14day * 1.08
-
-            # Compute the strategic charge target for this window.
-            # This replaces simple "target_pct or 100%" with a calculation that
-            # considers: how many days until the next cheap window, how expensive
-            # is the gap, and whether today's price justifies charging above target.
-            strategic_target, target_reason = self._strategic_target(
-                day_summaries=day_summaries,
-                from_idx=i,
-                today_overnight_avg=day["avg"],
-                user_target_pct=target_pct,
-                daily_usage=daily_usage,
-                battery_cap=battery_cap,
-                avg_14day=avg_14day,
-                p35=p35,
-            )
-
-            # --- Decision ---
-            if must_charge:
-                if today_is_cheap and upcoming_expensive and price_ratio >= 1.3:
-                    action = ACTION_FULL_CHARGE
-                    charge_to = strategic_target
+                # Build reason text
+                if action == ACTION_CHARGE:
+                    if triggered_by != i:
+                        reason = (
+                            f"{cheapest_day_name} is the cheapest overnight window before "
+                            f"the battery deadline ({day_summaries[triggered_by]['date'].strftime('%A')}). "
+                            f"Tonight averages {day['avg']:.1f}p. "
+                            f"{target_reason} — charging to {charge_to:.0f}%."
+                        )
+                    else:
+                        reason = (
+                            f"Battery must charge by tonight — no cheaper window available. "
+                            f"{target_reason} — charging to {charge_to:.0f}%."
+                        )
+                elif action == ACTION_FULL_CHARGE:
                     reason = (
-                        f"Battery needs charging soon AND today is cheap "
-                        f"({day['avg']:.1f}p, {((1 - day['avg'] / avg_14day) * 100):.0f}% below avg). "
+                        f"Cheapest overnight in the forecast ({day['avg']:.1f}p avg, "
+                        f"{((1 - day['avg'] / avg_14day) * 100):.0f}% below the {avg_14day:.1f}p avg). "
                         f"{target_reason} — charging to {charge_to:.0f}%."
                     )
-                else:
-                    action = ACTION_CHARGE
-                    charge_to = strategic_target
+                else:  # ACTION_OPPORTUNISTIC
+                    lookahead = day_summaries[i + 1 : i + 6]
+                    next_avg = statistics.mean(d["avg"] for d in lookahead) if lookahead else avg_14day
                     reason = (
-                        f"Battery will reach the {safety_pct:.0f}% safety threshold "
-                        f"within 2 days. {target_reason} — charging to {charge_to:.0f}%."
+                        f"Good opportunity — {day['avg']:.1f}p tonight vs {next_avg:.1f}p "
+                        f"over the next {len(lookahead)} days. "
+                        f"{target_reason} — charging to {charge_to:.0f}%."
                     )
 
-            elif today_is_very_cheap and upcoming_expensive and price_ratio >= 1.5 and battery_at_start < 98:
-                action = ACTION_FULL_CHARGE
-                charge_to = strategic_target
-                reason = (
-                    f"Exceptionally cheap tonight ({day['avg']:.1f}p — "
-                    f"{((1 - day['avg'] / avg_14day) * 100):.0f}% below the {avg_14day:.1f}p avg). "
-                    f"{target_reason} — charging to {charge_to:.0f}%."
-                )
+                # Pick cheapest slots from overnight window
+                available = [s for s in day["overnight_slots"] if s["datetime"] not in scheduled_dts]
 
-            elif today_is_cheap and upcoming_expensive and price_ratio >= 1.25 and battery_at_start < (strategic_target - 5):
-                action = ACTION_OPPORTUNISTIC
-                charge_to = strategic_target
-                reason = (
-                    f"Good opportunity — {day['avg']:.1f}p tonight vs {next_days_avg:.1f}p "
-                    f"over the next {len(lookahead)} days ({price_ratio:.1f}x more expensive). "
-                    f"{target_reason} — charging to {charge_to:.0f}%."
-                )
-
-            else:
-                action = ACTION_NO_CHARGE
-                charge_to = None
-                if day["avg"] > avg_14day * 1.10:
-                    reason = (
-                        f"Prices are {((day['avg'] / avg_14day - 1) * 100):.0f}% above "
-                        f"the 14-day average ({day['avg']:.1f}p vs {avg_14day:.1f}p) — "
-                        f"not charging today. Battery at {battery_at_start:.0f}%."
-                    )
-                else:
-                    reason = (
-                        f"Battery healthy at {battery_at_start:.0f}% and prices are average "
-                        f"({day['avg']:.1f}p) — no charge needed today."
-                    )
-
-            # --- Pick cheapest individual slots for this day's charge ---
-            charge_slots: list[dict] = []
-            if action != ACTION_NO_CHARGE:
-                current_kwh = (battery_at_start / 100) * battery_cap
-                target_kwh = (charge_to / 100) * battery_cap
-                charge_kwh = max(0.0, target_kwh - current_kwh)
-                n_slots = max(1, math.ceil(charge_kwh / kwh_per_slot))
-
-                # --- Slot candidates: OVERNIGHT WINDOW only ---
-                # Use overnight slots (18:00→09:00 next day) so we never schedule
-                # charging during expensive daytime hours.
-                available = [
-                    s for s in day["overnight_slots"]
-                    if s["datetime"] not in scheduled_dts
-                ]
-
-                # For must-charge: if overnight window is empty/past, fall back to
-                # the cheapest slots in the next 48 hours (safety takes priority).
+                # Must-charge safety fallback: if overnight is empty, use next 48h
                 if action == ACTION_CHARGE and not available:
                     cutoff = now + timedelta(hours=48)
                     available = [
                         s for s in prices
-                        if s["datetime"] > now
-                        and s["datetime"] < cutoff
+                        if s["datetime"] > now and s["datetime"] < cutoff
                         and s["datetime"] not in scheduled_dts
                     ]
 
-                # For opportunistic/full_charge: price cap — only use slots that are
-                # genuinely cheap (below 14-day average). If none qualify, skip.
+                # For opportunistic/full_charge: only use slots below 14-day average
                 if action in (ACTION_OPPORTUNISTIC, ACTION_FULL_CHARGE):
                     cheap_available = [s for s in available if s["price"] < avg_14day]
                     if not cheap_available:
-                        # No cheap slots actually available — downgrade to no_charge
                         action = ACTION_NO_CHARGE
                         charge_to = None
                         reason = (
                             f"Overnight window has no slots below the 14-day average "
-                            f"({avg_14day:.1f}p) — skipping opportunistic charge today."
+                            f"({avg_14day:.1f}p) — skipping charge today."
                         )
-                        battery = max(0.0, battery_at_start - depletion_pct_per_day)
                     else:
                         available = cheap_available
 
+                charge_slots: list[dict] = []
                 if action != ACTION_NO_CHARGE:
+                    current_kwh = (battery_at_start / 100) * battery_cap
+                    charge_kwh = max(0.0, (charge_to / 100 * battery_cap) - current_kwh)
+                    n_slots = max(1, math.ceil(charge_kwh / kwh_per_slot))
                     chosen = sorted(available, key=lambda s: s["price"])[:n_slots]
                     chosen.sort(key=lambda s: s["datetime"])
                     for s in chosen:
@@ -470,11 +441,30 @@ class EVChargeCoordinator(DataUpdateCoordinator):
                     charge_slots = chosen
                     all_charge_slots.extend(charge_slots)
                     battery = min(100.0, charge_to)
-            # battery already set above if downgraded to no_charge inside the block
-            if action == ACTION_NO_CHARGE and not charge_slots:
+                else:
+                    battery = max(0.0, battery_at_start - depletion_pct_per_day)
+
+            else:
+                action = ACTION_NO_CHARGE
+                charge_to = None
+                charge_slots = []
+                avg_text = f"{day['avg']:.1f}p"
+                if day["avg"] > avg_14day * 1.10:
+                    reason = (
+                        f"Overnight prices are {((day['avg'] / avg_14day - 1) * 100):.0f}% above "
+                        f"the 14-day average ({avg_text} vs {avg_14day:.1f}p) — not charging."
+                    )
+                else:
+                    reason = (
+                        f"Battery at {battery_at_start:.0f}%, prices are average ({avg_text}) "
+                        f"— no charge needed."
+                    )
                 battery = max(0.0, battery_at_start - depletion_pct_per_day)
 
-            # Slot times for display
+            # Cost & energy for this day's charging
+            slot_cost_pence = sum((s["price"] / 100) * kwh_per_slot * 100 for s in charge_slots)
+            slot_kwh = len(charge_slots) * kwh_per_slot
+
             slot_times = _format_slot_times(charge_slots, local_now)
             vs_avg = ((day["avg"] - avg_14day) / avg_14day * 100) if avg_14day > 0 else 0
             all_predicted = all(s.get("predicted", True) for s in day["slots"][:3]) if day["slots"] else True
@@ -503,10 +493,143 @@ class EVChargeCoordinator(DataUpdateCoordinator):
                 "prices_predicted": all_predicted,
                 "n_slots": len(charge_slots),
                 "charge_hours": round(len(charge_slots) * 0.5, 1),
+                "charge_kwh": round(slot_kwh, 2),
+                "charge_cost_gbp": round(slot_cost_pence / 100, 2),
             })
 
         all_charge_slots.sort(key=lambda s: s["datetime"])
         return weekly_plan, all_charge_slots
+
+    # ------------------------------------------------------------------
+    # Pass 1: Optimal charge assignment
+    # ------------------------------------------------------------------
+
+    def _build_optimal_schedule(
+        self,
+        day_summaries: list[dict],
+        current_battery_pct: float,
+        target_pct: float,
+        daily_usage: float,
+        battery_cap: float,
+        charge_rate: float,
+        avg_14day: float,
+        p15: float,
+        p35: float,
+    ) -> dict[int, dict]:
+        """Two-pass planner: assign charges to the cheapest window before each deadline.
+
+        Returns {day_idx: {action, charge_to, target_reason, cheapest_day_name, triggered_by}}
+
+        For mandatory charges (battery near safety):
+          - Calculate how many days until the battery hits the safety threshold.
+          - Look at overnight windows from today up to that deadline.
+          - Assign the charge to the CHEAPEST window, not the deadline day.
+          - This ensures 'Tuesday 25.5p chosen over Wednesday 26.3p' when battery
+            deadline falls on Wednesday.
+
+        For opportunistic charges (battery healthy but prices are cheap):
+          - Added for unscheduled cheap days after mandatory planning is done.
+        """
+        assignments: dict[int, dict] = {}
+        depletion = (daily_usage / battery_cap) * 100
+        battery = current_battery_pct
+
+        i = 0
+        while i < 7:
+            if i in assignments:
+                battery = assignments[i]["charge_to"]
+                i += 1
+                continue
+
+            # How many days until battery hits safety threshold?
+            days_until_critical = (battery - _SAFETY_PCT) / depletion if depletion > 0 else 99
+
+            if days_until_critical <= 2:
+                # Must charge before the deadline.
+                # deadline = last day we can charge and still be OK.
+                # We look one day earlier than the absolute last day so there's headroom.
+                deadline_idx = min(i + max(0, math.floor(days_until_critical) - 1), 6)
+                search_window = [
+                    j for j in range(i, deadline_idx + 1)
+                    if j not in assignments
+                ]
+                if not search_window:
+                    search_window = [i]
+
+                # Pick the cheapest overnight window in the search window
+                best_j = min(search_window, key=lambda j: day_summaries[j]["avg"])
+                best_day = day_summaries[best_j]
+
+                strategic_tgt, tgt_reason = self._strategic_target(
+                    day_summaries=day_summaries,
+                    from_idx=best_j,
+                    today_overnight_avg=best_day["avg"],
+                    user_target_pct=target_pct,
+                    daily_usage=daily_usage,
+                    battery_cap=battery_cap,
+                    avg_14day=avg_14day,
+                    p35=p35,
+                )
+
+                action = (
+                    ACTION_FULL_CHARGE if best_day["avg"] <= p15 else ACTION_CHARGE
+                )
+                assignments[best_j] = {
+                    "action": action,
+                    "charge_to": strategic_tgt,
+                    "target_reason": tgt_reason,
+                    "cheapest_day_name": best_day["date"].strftime("%A"),
+                    "triggered_by": i,  # day that triggered the need
+                }
+
+                # Advance simulation: deplete to best_j then charge
+                for _ in range(best_j - i):
+                    battery = max(0.0, battery - depletion)
+                battery = strategic_tgt
+                i = best_j + 1
+
+            else:
+                # Battery OK — check for opportunistic charge on day i
+                day = day_summaries[i]
+                lookahead = day_summaries[i + 1 : i + 6]
+                next_days_avg = (
+                    statistics.mean(d["avg"] for d in lookahead) if lookahead else avg_14day
+                )
+                price_ratio = next_days_avg / day["avg"] if day["avg"] > 0 else 1.0
+                today_is_cheap = day["avg"] <= p35
+                upcoming_expensive = next_days_avg > avg_14day * 1.08
+
+                if (
+                    today_is_cheap
+                    and upcoming_expensive
+                    and price_ratio >= 1.25
+                    and battery < (target_pct - 5)
+                ):
+                    strategic_tgt, tgt_reason = self._strategic_target(
+                        day_summaries=day_summaries,
+                        from_idx=i,
+                        today_overnight_avg=day["avg"],
+                        user_target_pct=target_pct,
+                        daily_usage=daily_usage,
+                        battery_cap=battery_cap,
+                        avg_14day=avg_14day,
+                        p35=p35,
+                    )
+                    action = ACTION_FULL_CHARGE if day["avg"] <= p15 else ACTION_OPPORTUNISTIC
+                    assignments[i] = {
+                        "action": action,
+                        "charge_to": strategic_tgt,
+                        "target_reason": tgt_reason,
+                        "cheapest_day_name": day["date"].strftime("%A"),
+                        "triggered_by": i,
+                    }
+                    battery = strategic_tgt
+                else:
+                    battery = max(0.0, battery - depletion)
+
+                i += 1
+
+        return assignments
 
     # ------------------------------------------------------------------
     # Strategic target calculation
