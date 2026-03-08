@@ -1,0 +1,56 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "EV Charge Optimizer",
+        "description": "Connect to AgilePredict ({api_url}) to get 14-day Octopus Agile price forecasts and receive intelligent EV charging recommendations.",
+        "data": {
+          "region": "Octopus Agile region",
+          "battery_capacity_kwh": "EV battery capacity (kWh)",
+          "daily_usage_kwh": "Average daily energy usage (kWh)",
+          "charge_rate_kw": "Charger power (kW)",
+          "min_charge_pct": "Minimum battery level (%)",
+          "target_charge_pct": "Target charge level (%)",
+          "battery_entity": "EV battery sensor (optional)",
+          "cheap_percentile": "Cheap price percentile cutoff (%)",
+          "expensive_percentile": "Expensive price percentile cutoff (%)"
+        },
+        "data_description": {
+          "region": "Your Octopus Energy DNO region code",
+          "battery_capacity_kwh": "Total usable battery capacity of your EV",
+          "daily_usage_kwh": "How much energy your car uses per day on average",
+          "charge_rate_kw": "Maximum power output of your home charger",
+          "min_charge_pct": "The lowest battery level you're comfortable letting the car reach",
+          "target_charge_pct": "The charge level to aim for (e.g. 80% for battery longevity)",
+          "battery_entity": "A Home Assistant sensor entity that reports the current battery %",
+          "cheap_percentile": "Prices below this percentile of the 14-day forecast are considered 'cheap'",
+          "expensive_percentile": "Prices above this percentile are considered 'expensive'"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Unable to reach the AgilePredict API. Check your internet connection and region code."
+    },
+    "abort": {
+      "already_configured": "EV Charge Optimizer is already configured for this region."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "EV Charge Optimizer Options",
+        "data": {
+          "region": "Octopus Agile region",
+          "battery_capacity_kwh": "EV battery capacity (kWh)",
+          "daily_usage_kwh": "Average daily energy usage (kWh)",
+          "charge_rate_kw": "Charger power (kW)",
+          "min_charge_pct": "Minimum battery level (%)",
+          "target_charge_pct": "Target charge level (%)",
+          "battery_entity": "EV battery sensor (optional)",
+          "cheap_percentile": "Cheap price percentile cutoff (%)",
+          "expensive_percentile": "Expensive price percentile cutoff (%)"
+        }
+      }
+    }
+  }
+}
