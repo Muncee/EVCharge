@@ -1,292 +1,49 @@
 """Sensor platform for EV Charge Optimizer."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
 from typing import Any
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
-    SensorEntityDescription,
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import (
-    PERCENTAGE,
-    UnitOfEnergy,
-    UnitOfTime,
-)
-
-CURRENCY_POUND = "GBP"
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from .const import (
     DOMAIN,
-    DATA_RECOMMENDATION,
-    DATA_REASON,
     DATA_CURRENT_PRICE,
-    DATA_AVG_PRICE,
-    DATA_CHEAP_THRESHOLD,
-    DATA_EXPENSIVE_THRESHOLD,
-    DATA_NEXT_CHEAP_WINDOW,
-    DATA_NEXT_CHEAP_PRICE,
-    DATA_HOURS_UNTIL_CHEAP,
-    DATA_CURRENT_BATTERY_PCT,
-    DATA_KWH_NEEDED,
-    DATA_HOURS_TO_CHARGE,
-    DATA_COST_NOW,
-    DATA_COST_CHEAPEST,
-    DATA_ESTIMATED_SAVINGS,
-    DATA_DAYS_OF_RANGE,
-    DATA_PCT_EXPENSIVE_7DAYS,
-    DATA_CHEAPEST_TODAY_PRICE,
-    DATA_CHEAPEST_TODAY_START,
-    DATA_CHEAPEST_UPCOMING_PRICE,
-    DATA_CHEAPEST_UPCOMING_START,
-    DATA_LONG_EXPENSIVE_DAYS,
-    DATA_NEXT_CHARGE_DATETIME,
-    DATA_NEXT_CHARGE_PRICE,
-    DATA_NEXT_CHARGE_TARGET_PCT,
-    DATA_SECOND_CHARGE_DATETIME,
-    DATA_NEXT_SCHEDULE_START,
-    DATA_NEXT_SCHEDULE_PRICE,
+    DATA_SCHEDULE,
+    DATA_NEXT_START,
+    DATA_NEXT_END,
+    DATA_SUMMARY,
+    DATA_SCHEDULE_ACTIVE,
 )
 from .coordinator import EVChargeCoordinator
 
-# Unit for electricity price in pence per kWh
 PENCE_PER_KWH = "p/kWh"
 
+_DEVICE_INFO = {
+    "identifiers": None,  # filled per-instance
+    "name": "EV Charge Optimizer",
+    "manufacturer": "AgilePredict",
+    "model": "EV Charge Optimizer",
+    "entry_type": "service",
+}
 
-@dataclass(frozen=True, kw_only=True)
-class EVSensorDescription(SensorEntityDescription):
-    """Extended description for EV Charge sensors."""
-    data_key: str = ""
 
-
-SENSOR_DESCRIPTIONS: tuple[EVSensorDescription, ...] = (
-    EVSensorDescription(
-        key="recommendation",
-        name="Charging Recommendation",
-        icon="mdi:car-electric",
-        data_key=DATA_RECOMMENDATION,
-    ),
-    EVSensorDescription(
-        key="recommendation_reason",
-        name="Recommendation Reason",
-        icon="mdi:text-box-outline",
-        data_key=DATA_REASON,
-    ),
-    EVSensorDescription(
-        key="current_price",
-        name="Current Electricity Price",
-        native_unit_of_measurement=PENCE_PER_KWH,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:currency-gbp",
-        data_key=DATA_CURRENT_PRICE,
-    ),
-    EVSensorDescription(
-        key="average_price_14day",
-        name="14-Day Average Price",
-        native_unit_of_measurement=PENCE_PER_KWH,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:chart-line",
-        data_key=DATA_AVG_PRICE,
-    ),
-    EVSensorDescription(
-        key="cheap_threshold",
-        name="Cheap Price Threshold",
-        native_unit_of_measurement=PENCE_PER_KWH,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:arrow-down-circle",
-        data_key=DATA_CHEAP_THRESHOLD,
-    ),
-    EVSensorDescription(
-        key="expensive_threshold",
-        name="Expensive Price Threshold",
-        native_unit_of_measurement=PENCE_PER_KWH,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:arrow-up-circle",
-        data_key=DATA_EXPENSIVE_THRESHOLD,
-    ),
-    EVSensorDescription(
-        key="next_cheap_window",
-        name="Next Cheap Window",
-        device_class=SensorDeviceClass.TIMESTAMP,
-        icon="mdi:clock-fast",
-        data_key=DATA_NEXT_CHEAP_WINDOW,
-    ),
-    EVSensorDescription(
-        key="next_cheap_price",
-        name="Next Cheap Window Price",
-        native_unit_of_measurement=PENCE_PER_KWH,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:lightning-bolt",
-        data_key=DATA_NEXT_CHEAP_PRICE,
-    ),
-    EVSensorDescription(
-        key="hours_until_cheap",
-        name="Hours Until Cheap Window",
-        native_unit_of_measurement=UnitOfTime.HOURS,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:timer-sand",
-        data_key=DATA_HOURS_UNTIL_CHEAP,
-    ),
-    EVSensorDescription(
-        key="battery_pct",
-        name="EV Battery Level",
-        native_unit_of_measurement=PERCENTAGE,
-        state_class=SensorStateClass.MEASUREMENT,
-        device_class=SensorDeviceClass.BATTERY,
-        icon="mdi:car-battery",
-        data_key=DATA_CURRENT_BATTERY_PCT,
-    ),
-    EVSensorDescription(
-        key="kwh_needed",
-        name="Energy Needed to Charge",
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        state_class=SensorStateClass.MEASUREMENT,
-        device_class=SensorDeviceClass.ENERGY,
-        icon="mdi:battery-charging",
-        data_key=DATA_KWH_NEEDED,
-    ),
-    EVSensorDescription(
-        key="hours_to_charge",
-        name="Hours to Charge",
-        native_unit_of_measurement=UnitOfTime.HOURS,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:timer-outline",
-        data_key=DATA_HOURS_TO_CHARGE,
-    ),
-    EVSensorDescription(
-        key="cost_to_charge_now",
-        name="Cost to Charge Now",
-        native_unit_of_measurement=CURRENCY_POUND,
-        state_class=SensorStateClass.MEASUREMENT,
-        device_class=SensorDeviceClass.MONETARY,
-        icon="mdi:cash",
-        data_key=DATA_COST_NOW,
-    ),
-    EVSensorDescription(
-        key="cost_at_cheapest_today",
-        name="Cost at Cheapest Today",
-        native_unit_of_measurement=CURRENCY_POUND,
-        state_class=SensorStateClass.MEASUREMENT,
-        device_class=SensorDeviceClass.MONETARY,
-        icon="mdi:cash-minus",
-        data_key=DATA_COST_CHEAPEST,
-    ),
-    EVSensorDescription(
-        key="estimated_savings",
-        name="Estimated Savings (Wait vs Now)",
-        native_unit_of_measurement=CURRENCY_POUND,
-        state_class=SensorStateClass.MEASUREMENT,
-        device_class=SensorDeviceClass.MONETARY,
-        icon="mdi:piggy-bank",
-        data_key=DATA_ESTIMATED_SAVINGS,
-    ),
-    EVSensorDescription(
-        key="days_of_battery_range",
-        name="Days of Battery Range",
-        native_unit_of_measurement="days",
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:road-variant",
-        data_key=DATA_DAYS_OF_RANGE,
-    ),
-    EVSensorDescription(
-        key="pct_expensive_next_7days",
-        name="Expensive Period (Next 7 Days)",
-        native_unit_of_measurement=PERCENTAGE,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:calendar-alert",
-        data_key=DATA_PCT_EXPENSIVE_7DAYS,
-    ),
-    EVSensorDescription(
-        key="cheapest_price_today",
-        name="Cheapest Price Today",
-        native_unit_of_measurement=PENCE_PER_KWH,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:sale",
-        data_key=DATA_CHEAPEST_TODAY_PRICE,
-    ),
-    EVSensorDescription(
-        key="cheapest_window_today",
-        name="Cheapest Window Today",
-        device_class=SensorDeviceClass.TIMESTAMP,
-        icon="mdi:clock-check",
-        data_key=DATA_CHEAPEST_TODAY_START,
-    ),
-    EVSensorDescription(
-        key="cheapest_upcoming_price",
-        name="Cheapest Upcoming Price",
-        native_unit_of_measurement=PENCE_PER_KWH,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:sale-outline",
-        data_key=DATA_CHEAPEST_UPCOMING_PRICE,
-    ),
-    EVSensorDescription(
-        key="cheapest_upcoming_window",
-        name="Cheapest Upcoming Window",
-        device_class=SensorDeviceClass.TIMESTAMP,
-        icon="mdi:clock-star-four-points",
-        data_key=DATA_CHEAPEST_UPCOMING_START,
-    ),
-    EVSensorDescription(
-        key="long_expensive_days",
-        name="Longest Upcoming Expensive Period",
-        native_unit_of_measurement="days",
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:weather-sunny-alert",
-        data_key=DATA_LONG_EXPENSIVE_DAYS,
-    ),
-    EVSensorDescription(
-        key="next_charge_datetime",
-        name="Optimal Next Charge Time",
-        device_class=SensorDeviceClass.TIMESTAMP,
-        icon="mdi:calendar-clock",
-        data_key=DATA_NEXT_CHARGE_DATETIME,
-    ),
-    EVSensorDescription(
-        key="next_charge_price",
-        name="Price at Next Optimal Charge",
-        native_unit_of_measurement=PENCE_PER_KWH,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:tag-outline",
-        data_key=DATA_NEXT_CHARGE_PRICE,
-    ),
-    EVSensorDescription(
-        key="next_charge_target_pct",
-        name="Next Charge Target Level",
-        native_unit_of_measurement=PERCENTAGE,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:battery-charging-100",
-        data_key=DATA_NEXT_CHARGE_TARGET_PCT,
-    ),
-    EVSensorDescription(
-        key="second_charge_datetime",
-        name="Estimated Second Charge Time",
-        device_class=SensorDeviceClass.TIMESTAMP,
-        icon="mdi:calendar-clock-outline",
-        data_key=DATA_SECOND_CHARGE_DATETIME,
-    ),
-    EVSensorDescription(
-        key="next_schedule_start",
-        name="Next Scheduled Charge Window",
-        device_class=SensorDeviceClass.TIMESTAMP,
-        icon="mdi:calendar-check",
-        data_key=DATA_NEXT_SCHEDULE_START,
-    ),
-    EVSensorDescription(
-        key="next_schedule_price",
-        name="Next Scheduled Charge Price",
-        native_unit_of_measurement=PENCE_PER_KWH,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:currency-gbp",
-        data_key=DATA_NEXT_SCHEDULE_PRICE,
-    ),
-)
+def _device(entry_id: str) -> dict:
+    return {
+        "identifiers": {(DOMAIN, entry_id)},
+        "name": "EV Charge Optimizer",
+        "manufacturer": "AgilePredict",
+        "model": "EV Charge Optimizer",
+        "entry_type": "service",
+    }
 
 
 async def async_setup_entry(
@@ -295,55 +52,119 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coordinator: EVChargeCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities(
-        EVChargeSensor(coordinator, entry, desc)
-        for desc in SENSOR_DESCRIPTIONS
-    )
+    async_add_entities([
+        CurrentPriceSensor(coordinator, entry),
+        WeeklyScheduleSensor(coordinator, entry),
+        NextChargeStartSensor(coordinator, entry),
+        NextChargeEndSensor(coordinator, entry),
+    ])
 
 
-class EVChargeSensor(CoordinatorEntity[EVChargeCoordinator], SensorEntity):
-    """A sensor entity that reads from the EV Charge coordinator."""
+# ---------------------------------------------------------------------------
 
-    entity_description: EVSensorDescription
+class CurrentPriceSensor(CoordinatorEntity[EVChargeCoordinator], SensorEntity):
+    """Current Agile electricity price."""
+
     _attr_has_entity_name = True
+    _attr_name = "Current Price"
+    _attr_icon = "mdi:lightning-bolt"
+    _attr_native_unit_of_measurement = PENCE_PER_KWH
+    _attr_state_class = SensorStateClass.MEASUREMENT
 
-    def __init__(
-        self,
-        coordinator: EVChargeCoordinator,
-        entry: ConfigEntry,
-        description: EVSensorDescription,
-    ) -> None:
+    def __init__(self, coordinator: EVChargeCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
-        self.entity_description = description
-        self._attr_unique_id = f"{entry.entry_id}_{description.key}"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, entry.entry_id)},
-            "name": "EV Charge Optimizer",
-            "manufacturer": "AgilePredict",
-            "model": "EV Charge Optimizer",
-            "entry_type": "service",
-        }
+        self._attr_unique_id = f"{entry.entry_id}_current_price"
+        self._attr_device_info = _device(entry.entry_id)
 
     @property
-    def native_value(self) -> Any:
-        if self.coordinator.data is None:
-            return None
-        value = self.coordinator.data.get(self.entity_description.data_key)
-        # datetime values are returned as-is (HA handles them for TIMESTAMP devices)
-        return value
+    def native_value(self) -> float | None:
+        return self.coordinator.data and self.coordinator.data.get(DATA_CURRENT_PRICE)
+
+
+class WeeklyScheduleSensor(CoordinatorEntity[EVChargeCoordinator], SensorEntity):
+    """Human-readable weekly charge schedule.
+
+    State: short summary of next session.
+    Attributes: full list of planned sessions.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Weekly Charge Schedule"
+    _attr_icon = "mdi:calendar-clock"
+
+    def __init__(self, coordinator: EVChargeCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_weekly_schedule"
+        self._attr_device_info = _device(entry.entry_id)
+
+    @property
+    def native_value(self) -> str | None:
+        return self.coordinator.data and self.coordinator.data.get(DATA_SUMMARY)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Expose extra attributes on the recommendation sensor."""
-        if self.entity_description.key != "recommendation":
+        if not self.coordinator.data:
             return {}
-        data = self.coordinator.data or {}
+        schedule = self.coordinator.data.get(DATA_SCHEDULE, [])
+        now = dt_util.utcnow()
+        sessions = []
+        for s in schedule:
+            start_local = dt_util.as_local(s["start"])
+            end_local = dt_util.as_local(s["end"])
+            diff_days = (start_local.date() - dt_util.as_local(now).date()).days
+            if diff_days == 0:
+                day_label = "Today"
+            elif diff_days == 1:
+                day_label = "Tomorrow"
+            else:
+                day_label = start_local.strftime("%A %-d %b")
+            sessions.append({
+                "day": day_label,
+                "start": start_local.strftime("%H:%M"),
+                "end": end_local.strftime("%H:%M"),
+                "avg_price_p_kwh": s["avg_price"],
+                "duration_hours": s["duration_hours"],
+                "target_pct": s["target_pct"],
+                "prices_predicted": s.get("predicted", True),
+                "status": "active" if s["start"] <= now < s["end"] else "upcoming",
+            })
         return {
-            "reason": data.get(DATA_REASON),
-            "current_price_pence": data.get(DATA_CURRENT_PRICE),
-            "cheap_threshold_pence": data.get(DATA_CHEAP_THRESHOLD),
-            "expensive_threshold_pence": data.get(DATA_EXPENSIVE_THRESHOLD),
-            "pct_expensive_7days": data.get(DATA_PCT_EXPENSIVE_7DAYS),
-            "longest_expensive_run_days": data.get(DATA_LONG_EXPENSIVE_DAYS),
-            "battery_range_days": data.get(DATA_DAYS_OF_RANGE),
+            "sessions": sessions,
+            "charging_now": self.coordinator.data.get(DATA_SCHEDULE_ACTIVE, False),
         }
+
+
+class NextChargeStartSensor(CoordinatorEntity[EVChargeCoordinator], SensorEntity):
+    """Timestamp of the next planned charge window start (for automations)."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Next Charge Start"
+    _attr_icon = "mdi:play-circle-outline"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+
+    def __init__(self, coordinator: EVChargeCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_next_charge_start"
+        self._attr_device_info = _device(entry.entry_id)
+
+    @property
+    def native_value(self):
+        return self.coordinator.data and self.coordinator.data.get(DATA_NEXT_START)
+
+
+class NextChargeEndSensor(CoordinatorEntity[EVChargeCoordinator], SensorEntity):
+    """Timestamp of the next planned charge window end (for automations)."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Next Charge End"
+    _attr_icon = "mdi:stop-circle-outline"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+
+    def __init__(self, coordinator: EVChargeCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_next_charge_end"
+        self._attr_device_info = _device(entry.entry_id)
+
+    @property
+    def native_value(self):
+        return self.coordinator.data and self.coordinator.data.get(DATA_NEXT_END)
