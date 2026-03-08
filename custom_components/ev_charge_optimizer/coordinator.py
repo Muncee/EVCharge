@@ -143,20 +143,22 @@ class EVChargeCoordinator(DataUpdateCoordinator):
                     if not isinstance(item, dict):
                         continue
                     dt_str = (
-                        item.get("datetime")
+                        item.get("date_time")
+                        or item.get("datetime")
                         or item.get("valid_from")
                         or item.get("time")
                         or item.get("period")
                     )
                     price = float(
-                        item.get("forecast")
+                        item.get("agile_pred")
+                        or item.get("forecast")
                         or item.get("price")
                         or item.get("value_inc_vat")
                         or item.get("value")
                         or 0
                     )
-                    high = float(item.get("high", price))
-                    low = float(item.get("low", price))
+                    high = float(item.get("agile_high") or item.get("high") or price)
+                    low = float(item.get("agile_low") or item.get("low") or price)
                     if dt_str:
                         dt = dt_util.parse_datetime(str(dt_str))
                         if dt:
