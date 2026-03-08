@@ -261,32 +261,66 @@ class EVChargeCoordinator(DataUpdateCoordinator):
         p15 = _percentile(all_14d, 15)   # very cheap
         p35 = _percentile(all_14d, 35)   # somewhat cheap
 
-        # Per-calendar-day price summary for next 7 days
+        # Per-calendar-day price summary for next 7 days.
+        #
+        # KEY DESIGN: decisions and slot picking use the OVERNIGHT WINDOW
+        # (18:00 today → 09:00 tomorrow) rather than the full calendar day.
+        # This stops the planner from scheduling charging during expensive
+        # daytime hours just because it's still "today".
         day_summaries = []
         for i in range(7):
             day_date = local_now.date() + timedelta(days=i)
+
+            # Full calendar day (for avg/min display only)
             day_start_local = datetime(
                 day_date.year, day_date.month, day_date.day,
                 tzinfo=local_now.tzinfo,
             )
             day_start_utc = dt_util.as_utc(day_start_local)
             day_end_utc = day_start_utc + timedelta(days=1)
-            # Today: only future slots; other days: all slots
-            if i == 0:
-                day_slots = [s for s in future_slots if s["datetime"] < day_end_utc]
-            else:
-                day_slots = [s for s in prices if day_start_utc <= s["datetime"] < day_end_utc]
 
-            if day_slots:
-                day_avg = statistics.mean(s["price"] for s in day_slots)
-                day_min = min(s["price"] for s in day_slots)
+            # Overnight charging window: 18:00 tonight → 09:00 tomorrow
+            overnight_start_local = datetime(
+                day_date.year, day_date.month, day_date.day, 18, 0,
+                tzinfo=local_now.tzinfo,
+            )
+            next_date = day_date + timedelta(days=1)
+            overnight_end_local = datetime(
+                next_date.year, next_date.month, next_date.day, 9, 0,
+                tzinfo=local_now.tzinfo,
+            )
+            overnight_start_utc = dt_util.as_utc(overnight_start_local)
+            overnight_end_utc = dt_util.as_utc(overnight_end_local)
+
+            # For today: start from max(now, 18:00) so we never look backwards
+            effective_overnight_start = max(now, overnight_start_utc) if i == 0 else overnight_start_utc
+
+            all_day_slots = [
+                s for s in (future_slots if i == 0 else prices)
+                if day_start_utc <= s["datetime"] < day_end_utc
+            ]
+            overnight_slots_all = [
+                s for s in prices
+                if effective_overnight_start <= s["datetime"] < overnight_end_utc
+            ]
+
+            # Average/min based on overnight window — that's what drives the decision
+            if overnight_slots_all:
+                day_avg = statistics.mean(s["price"] for s in overnight_slots_all)
+                day_min = min(s["price"] for s in overnight_slots_all)
+            elif all_day_slots:
+                day_avg = statistics.mean(s["price"] for s in all_day_slots)
+                day_min = min(s["price"] for s in all_day_slots)
             else:
                 day_avg = avg_14day
                 day_min = avg_14day
 
             day_summaries.append({
                 "date": day_date,
-                "slots": day_slots,
+                "slots": all_day_slots,              # display only
+                "overnight_slots": overnight_slots_all,  # slot picking
+                "overnight_start": effective_overnight_start,
+                "overnight_end": overnight_end_utc,
                 "avg": day_avg,
                 "min": day_min,
             })
@@ -389,26 +423,51 @@ class EVChargeCoordinator(DataUpdateCoordinator):
                 charge_kwh = max(0.0, target_kwh - current_kwh)
                 n_slots = max(1, math.ceil(charge_kwh / kwh_per_slot))
 
-                # Candidates: this day's slots (plus early next morning if needed)
-                available = [s for s in day["slots"] if s["datetime"] not in scheduled_dts]
-                if len(available) < n_slots and i + 1 < len(day_summaries):
-                    next_morning = [
-                        s for s in day_summaries[i + 1]["slots"]
-                        if s["datetime"] not in scheduled_dts
-                        and dt_util.as_local(s["datetime"]).hour < 9
+                # --- Slot candidates: OVERNIGHT WINDOW only ---
+                # Use overnight slots (18:00→09:00 next day) so we never schedule
+                # charging during expensive daytime hours.
+                available = [
+                    s for s in day["overnight_slots"]
+                    if s["datetime"] not in scheduled_dts
+                ]
+
+                # For must-charge: if overnight window is empty/past, fall back to
+                # the cheapest slots in the next 48 hours (safety takes priority).
+                if action == ACTION_CHARGE and not available:
+                    cutoff = now + timedelta(hours=48)
+                    available = [
+                        s for s in prices
+                        if s["datetime"] > now
+                        and s["datetime"] < cutoff
+                        and s["datetime"] not in scheduled_dts
                     ]
-                    available = available + next_morning
 
-                chosen = sorted(available, key=lambda s: s["price"])[:n_slots]
-                chosen.sort(key=lambda s: s["datetime"])
+                # For opportunistic/full_charge: price cap — only use slots that are
+                # genuinely cheap (below 14-day average). If none qualify, skip.
+                if action in (ACTION_OPPORTUNISTIC, ACTION_FULL_CHARGE):
+                    cheap_available = [s for s in available if s["price"] < avg_14day]
+                    if not cheap_available:
+                        # No cheap slots actually available — downgrade to no_charge
+                        action = ACTION_NO_CHARGE
+                        charge_to = None
+                        reason = (
+                            f"Overnight window has no slots below the 14-day average "
+                            f"({avg_14day:.1f}p) — skipping opportunistic charge today."
+                        )
+                        battery = max(0.0, battery_at_start - depletion_pct_per_day)
+                    else:
+                        available = cheap_available
 
-                for s in chosen:
-                    scheduled_dts.add(s["datetime"])
-                charge_slots = chosen
-                all_charge_slots.extend(chosen)
-
-                battery = min(100.0, charge_to)
-            else:
+                if action != ACTION_NO_CHARGE:
+                    chosen = sorted(available, key=lambda s: s["price"])[:n_slots]
+                    chosen.sort(key=lambda s: s["datetime"])
+                    for s in chosen:
+                        scheduled_dts.add(s["datetime"])
+                    charge_slots = chosen
+                    all_charge_slots.extend(charge_slots)
+                    battery = min(100.0, charge_to)
+            # battery already set above if downgraded to no_charge inside the block
+            if action == ACTION_NO_CHARGE and not charge_slots:
                 battery = max(0.0, battery_at_start - depletion_pct_per_day)
 
             # Slot times for display
