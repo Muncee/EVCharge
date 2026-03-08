@@ -24,7 +24,8 @@ from .const import (
     CONF_TARGET_CHARGE_PCT,
     CONF_BATTERY_ENTITY,
     DATA_CURRENT_PRICE,
-    DATA_SCHEDULE,
+    DATA_SCHEDULE_SLOTS,
+    DATA_SCHEDULE_SESSIONS,
     DATA_SCHEDULE_ACTIVE,
     DATA_NEXT_START,
     DATA_NEXT_END,
@@ -34,7 +35,6 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Battery level below which we consider it "at safety buffer" and plan the next charge
 _SAFETY_PCT = 10.0
 
 
@@ -49,7 +49,6 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             update_interval=timedelta(minutes=UPDATE_INTERVAL_MINUTES),
         )
         self.config = config
-        # Runtime overrides set by number entities
         self.overrides: dict[str, Any] = {}
         self._last_notification_date: Any = None
 
@@ -70,7 +69,7 @@ class EVChargeCoordinator(DataUpdateCoordinator):
                         raise UpdateFailed(f"AgilePredict API returned HTTP {resp.status}")
                     raw = await resp.json(content_type=None)
         except aiohttp.ClientError as err:
-            raise UpdateFailed(f"Network error fetching AgilePredict data: {err}") from err
+            raise UpdateFailed(f"Network error: {err}") from err
 
         prices = self._parse_prices(raw)
         if not prices:
@@ -79,9 +78,7 @@ class EVChargeCoordinator(DataUpdateCoordinator):
 
         result = self._compute(prices)
 
-        # Fire a HA event once per day after 16:30 local time.
-        # Octopus publishes next-day Agile prices ~4pm, so the first hourly
-        # update after 16:30 will pick them up.
+        # Fire event once per day after 16:30 local — when next-day Agile prices land
         local_now = dt_util.as_local(dt_util.utcnow())
         after_430 = local_now.hour > 16 or (local_now.hour == 16 and local_now.minute >= 30)
         if after_430 and self._last_notification_date != local_now.date():
@@ -91,20 +88,17 @@ class EVChargeCoordinator(DataUpdateCoordinator):
                 {
                     "summary": result[DATA_SUMMARY],
                     "current_price": result[DATA_CURRENT_PRICE],
-                    "next_charge_start": (
-                        result[DATA_NEXT_START].isoformat() if result[DATA_NEXT_START] else None
-                    ),
                 },
             )
 
         return result
 
     # ------------------------------------------------------------------
-    # Parsing
+    # Price parsing
     # ------------------------------------------------------------------
 
     def _parse_prices(self, raw: Any) -> list[dict]:
-        """Return sorted list of {datetime, price, predicted} from AgilePredict response."""
+        """Return sorted list of {datetime, price, predicted} dicts."""
         prices: list[dict] = []
         try:
             forecast = raw[0] if isinstance(raw, list) and raw else raw
@@ -152,7 +146,7 @@ class EVChargeCoordinator(DataUpdateCoordinator):
         return prices
 
     # ------------------------------------------------------------------
-    # Schedule computation
+    # Strategy
     # ------------------------------------------------------------------
 
     def _compute(self, prices: list[dict]) -> dict[str, Any]:
@@ -163,11 +157,9 @@ class EVChargeCoordinator(DataUpdateCoordinator):
         daily_usage: float = float(self.overrides.get(CONF_DAILY_USAGE, self.config[CONF_DAILY_USAGE]))
         target_pct: float = float(self.overrides.get(CONF_TARGET_CHARGE_PCT, self.config[CONF_TARGET_CHARGE_PCT]))
 
-        current_battery_pct = self._get_battery_pct()
-        if current_battery_pct is None:
-            current_battery_pct = target_pct
+        current_battery_pct = self._get_battery_pct() or target_pct
 
-        # Current slot price
+        # Current price
         current_slot = next(
             (s for s in prices if s["datetime"] <= now < s["datetime"] + timedelta(minutes=30)),
             None,
@@ -179,7 +171,7 @@ class EVChargeCoordinator(DataUpdateCoordinator):
         )
 
         # Build schedule
-        schedule = self._build_schedule(
+        schedule_slots = self._build_schedule(
             prices=prices,
             current_battery_pct=current_battery_pct,
             target_pct=target_pct,
@@ -189,18 +181,27 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             now=now,
         )
 
-        # Determine current/next window
-        active = next((s for s in schedule if s["start"] <= now < s["end"]), None)
-        upcoming = next((s for s in schedule if s["start"] > now), None)
+        # Group into display sessions
+        sessions = _group_into_sessions(schedule_slots)
 
-        summary = self._make_summary(schedule, active, current_price, now)
+        # Is a charge slot active right now?
+        active_slot = next(
+            (s for s in schedule_slots if s["datetime"] <= now < s["datetime"] + timedelta(minutes=30)),
+            None,
+        )
+
+        # Next upcoming slot
+        next_slot = next((s for s in schedule_slots if s["datetime"] > now), None)
+
+        summary = self._make_summary(sessions, active_slot, now)
 
         return {
             DATA_CURRENT_PRICE: round(current_price, 2) if current_price is not None else None,
-            DATA_SCHEDULE: schedule,
-            DATA_SCHEDULE_ACTIVE: active is not None,
-            DATA_NEXT_START: upcoming["start"] if upcoming else None,
-            DATA_NEXT_END: upcoming["end"] if upcoming else None,
+            DATA_SCHEDULE_SLOTS: schedule_slots,
+            DATA_SCHEDULE_SESSIONS: sessions,
+            DATA_SCHEDULE_ACTIVE: active_slot is not None,
+            DATA_NEXT_START: next_slot["datetime"] if next_slot else None,
+            DATA_NEXT_END: next_slot["datetime"] + timedelta(minutes=30) if next_slot else None,
             DATA_SUMMARY: summary,
         }
 
@@ -214,29 +215,28 @@ class EVChargeCoordinator(DataUpdateCoordinator):
         charge_rate: float,
         now: datetime,
     ) -> list[dict]:
-        """Build a 7-day charge schedule.
+        """Build a 7-day list of individual 30-min charge slots.
 
-        For each cycle, calculates exactly how many 30-min slots are needed
-        to charge from the safety level to target%, then uses a sliding window
-        to find the cheapest CONTIGUOUS block of that many slots before the
-        battery deadline. This means if you need 5 hours, it finds the cheapest
-        5-hour window — not just the single cheapest slot.
+        For each charge cycle:
+          1. Calculate when the battery will hit the safety threshold
+          2. Calculate how many slots are needed to reach target%
+          3. Pick the N *cheapest individual slots* within the deadline window
+             (not necessarily consecutive — charger turns on/off per slot)
+          4. Repeat from target% after the last planned slot
         """
         if daily_usage <= 0 or charge_rate <= 0:
             return []
 
-        safety_pct = _SAFETY_PCT
-        safety_kwh = (safety_pct / 100) * battery_cap
+        safety_kwh = (_SAFETY_PCT / 100) * battery_cap
         target_kwh = (target_pct / 100) * battery_cap
-        # Slots needed to charge from safety to target
-        kwh_per_slot = charge_rate * 0.5  # 30-min slot
-        n_slots_needed = max(1, math.ceil((target_kwh - safety_kwh) / kwh_per_slot))
+        kwh_per_slot = charge_rate * 0.5  # energy added in one 30-min slot
 
-        schedule: list[dict] = []
+        all_slots: list[dict] = []
         battery = current_battery_pct
         t = now
         horizon = now + timedelta(days=7)
-        future_slots = [s for s in prices if s["datetime"] > now]
+        future_prices = [s for s in prices if s["datetime"] >= now]
+        scheduled_dts: set[datetime] = set()  # avoid double-booking a slot
 
         for _ in range(20):
             current_kwh = (battery / 100) * battery_cap
@@ -245,133 +245,90 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             must_charge_by = t + timedelta(hours=hours_of_range)
 
             if must_charge_by > horizon:
-                break  # battery lasts the whole week — nothing to plan
+                break  # battery lasts the full week
 
-            # Find cheapest contiguous block before deadline
-            block = self._cheapest_block(
-                slots=[s for s in future_slots if t < s["datetime"]],
-                n=n_slots_needed,
-                deadline=must_charge_by,
-            )
+            # How many slots to go from safety% to target%?
+            kwh_needed = max(0.0, target_kwh - safety_kwh)
+            n_slots = max(1, math.ceil(kwh_needed / kwh_per_slot))
 
-            if block is None:
+            # Candidate slots: after t, before deadline, not already scheduled
+            candidates = [
+                s for s in future_prices
+                if s["datetime"] > t
+                and s["datetime"] < must_charge_by
+                and s["datetime"] not in scheduled_dts
+            ]
+
+            if len(candidates) < n_slots:
+                # Deadline is tight — take what we can find
+                candidates = [
+                    s for s in future_prices
+                    if s["datetime"] > t and s["datetime"] not in scheduled_dts
+                ][:n_slots * 3]
+
+            if not candidates:
                 break
 
-            start_dt = block[0]["datetime"]
-            end_dt = block[-1]["datetime"] + timedelta(minutes=30)
-            avg_price = sum(s["price"] for s in block) / len(block)
-            all_predicted = all(s.get("predicted", True) for s in block)
+            # Pick the cheapest N individual slots
+            chosen = sorted(candidates, key=lambda s: s["price"])[:n_slots]
+            chosen.sort(key=lambda s: s["datetime"])
 
-            schedule.append({
-                "start": start_dt,
-                "end": end_dt,
-                "avg_price": round(avg_price, 2),
-                "duration_hours": round(len(block) * 0.5, 1),
-                "target_pct": target_pct,
-                "predicted": all_predicted,
-            })
+            for slot in chosen:
+                scheduled_dts.add(slot["datetime"])
+                all_slots.append(slot)
 
+            # Next cycle starts after the last chosen slot
+            last_slot = chosen[-1]
+            t = last_slot["datetime"] + timedelta(minutes=30)
             battery = target_pct
-            t = end_dt
 
             if t >= horizon:
                 break
 
-        return schedule
-
-    def _cheapest_block(
-        self, slots: list[dict], n: int, deadline: datetime
-    ) -> list[dict] | None:
-        """Return the cheapest contiguous n-slot block that ends by deadline.
-
-        Uses a sliding window over time-sorted consecutive slots.
-        Falls back to earliest available slots if no perfect block exists.
-        """
-        # Only consider slots that start early enough so the block ends by deadline
-        cutoff = deadline - timedelta(minutes=30 * (n - 1))
-        candidates = [s for s in slots if s["datetime"] <= cutoff]
-        if not candidates:
-            # Deadline too tight — take the n soonest slots we can get
-            earliest = slots[:n]
-            return earliest if earliest else None
-
-        # Build runs of consecutive slots (30-min apart)
-        # Group into runs, then apply sliding window within each run
-        best_block: list[dict] | None = None
-        best_cost: float | None = None
-
-        i = 0
-        while i < len(candidates):
-            # Build the longest consecutive run starting at i
-            run = [candidates[i]]
-            j = i + 1
-            while j < len(candidates):
-                gap = candidates[j]["datetime"] - candidates[j - 1]["datetime"]
-                if gap == timedelta(minutes=30):
-                    run.append(candidates[j])
-                    j += 1
-                else:
-                    break
-
-            # Slide an n-wide window over this run
-            if len(run) >= n:
-                window_cost = sum(s["price"] for s in run[:n])
-                if best_cost is None or window_cost < best_cost:
-                    best_cost = window_cost
-                    best_block = run[:n]
-                for k in range(1, len(run) - n + 1):
-                    window_cost += run[k + n - 1]["price"] - run[k - 1]["price"]
-                    if window_cost < best_cost:
-                        best_cost = window_cost
-                        best_block = run[k: k + n]
-            elif run:
-                # Run shorter than needed — take what we can as fallback
-                cost = sum(s["price"] for s in run)
-                if best_cost is None or cost < best_cost:
-                    best_cost = cost
-                    best_block = run
-
-            i = j  # move to next run
-
-        return best_block
+        all_slots.sort(key=lambda s: s["datetime"])
+        return all_slots
 
     # ------------------------------------------------------------------
-    # Summary text
+    # Summary
     # ------------------------------------------------------------------
 
     def _make_summary(
         self,
-        schedule: list[dict],
-        active: dict | None,
-        current_price: float | None,
+        sessions: list[dict],
+        active_slot: dict | None,
         now: datetime,
     ) -> str:
-        if active:
-            end_local = dt_util.as_local(active["end"])
-            return (
-                f"Charging now until {end_local.strftime('%H:%M')} "
-                f"({active['avg_price']:.1f}p avg)"
+        if active_slot:
+            # Find which session is active
+            active_sess = next(
+                (s for s in sessions if s["start"] <= now < s["end"]),
+                None,
             )
-        if not schedule:
-            return "No charge sessions planned (check daily usage setting)"
+            if active_sess:
+                end_local = dt_util.as_local(active_sess["end"])
+                return (
+                    f"Charging now until {end_local.strftime('%H:%M')} "
+                    f"({active_sess['avg_price']:.1f}p avg)"
+                )
+            return "Charging now"
 
-        upcoming = next((s for s in schedule if s["start"] > now), None)
+        if not sessions:
+            return "No charge sessions planned — check daily usage setting"
+
+        upcoming = next((s for s in sessions if s["start"] > now), None)
         if not upcoming:
             return "All sessions complete for this week"
 
         start_local = dt_util.as_local(upcoming["start"])
         end_local = dt_util.as_local(upcoming["end"])
-        diff_days = (start_local.date() - dt_util.as_local(now).date()).days
-        if diff_days == 0:
-            day = "Today"
-        elif diff_days == 1:
-            day = "Tomorrow"
-        else:
-            day = start_local.strftime("%A")
+        diff = (start_local.date() - dt_util.as_local(now).date()).days
+        day = "Today" if diff == 0 else "Tomorrow" if diff == 1 else start_local.strftime("%A")
 
+        n_slots = upcoming["n_slots"]
+        hours = n_slots * 0.5
         return (
             f"Next: {day} {start_local.strftime('%H:%M')}–{end_local.strftime('%H:%M')} "
-            f"({upcoming['avg_price']:.1f}p avg, {upcoming['duration_hours']:.1f}h)"
+            f"({n_slots} slots, {hours:.1f}h, {upcoming['avg_price']:.1f}p avg)"
         )
 
     # ------------------------------------------------------------------
@@ -389,3 +346,43 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             except ValueError:
                 pass
         return None
+
+
+# ------------------------------------------------------------------
+# Grouping helper (module-level — used by both coordinator and sensors)
+# ------------------------------------------------------------------
+
+def _group_into_sessions(slots: list[dict]) -> list[dict]:
+    """Group consecutive 30-min slots into display sessions.
+
+    Two slots belong to the same session if they are exactly 30 min apart.
+    Non-consecutive cheap slots appear as separate session entries.
+    """
+    if not slots:
+        return []
+
+    sessions = []
+    run = [slots[0]]
+
+    for slot in slots[1:]:
+        gap = slot["datetime"] - run[-1]["datetime"]
+        if gap == timedelta(minutes=30):
+            run.append(slot)
+        else:
+            sessions.append(_session_from_run(run))
+            run = [slot]
+    sessions.append(_session_from_run(run))
+    return sessions
+
+
+def _session_from_run(run: list[dict]) -> dict:
+    return {
+        "start": run[0]["datetime"],
+        "end": run[-1]["datetime"] + timedelta(minutes=30),
+        "n_slots": len(run),
+        "avg_price": round(sum(s["price"] for s in run) / len(run), 2),
+        "min_price": round(min(s["price"] for s in run), 2),
+        "max_price": round(max(s["price"] for s in run), 2),
+        "predicted": all(s.get("predicted", True) for s in run),
+        "slots": [{"datetime": s["datetime"], "price": round(s["price"], 2)} for s in run],
+    }

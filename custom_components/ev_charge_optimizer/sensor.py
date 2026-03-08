@@ -17,23 +17,15 @@ from homeassistant.util import dt as dt_util
 from .const import (
     DOMAIN,
     DATA_CURRENT_PRICE,
-    DATA_SCHEDULE,
+    DATA_SCHEDULE_SESSIONS,
+    DATA_SCHEDULE_ACTIVE,
     DATA_NEXT_START,
     DATA_NEXT_END,
     DATA_SUMMARY,
-    DATA_SCHEDULE_ACTIVE,
 )
 from .coordinator import EVChargeCoordinator
 
 PENCE_PER_KWH = "p/kWh"
-
-_DEVICE_INFO = {
-    "identifiers": None,  # filled per-instance
-    "name": "EV Charge Optimizer",
-    "manufacturer": "AgilePredict",
-    "model": "EV Charge Optimizer",
-    "entry_type": "service",
-}
 
 
 def _device(entry_id: str) -> dict:
@@ -63,7 +55,7 @@ async def async_setup_entry(
 # ---------------------------------------------------------------------------
 
 class CurrentPriceSensor(CoordinatorEntity[EVChargeCoordinator], SensorEntity):
-    """Current Agile electricity price."""
+    """Current Agile electricity price in p/kWh."""
 
     _attr_has_entity_name = True
     _attr_name = "Current Price"
@@ -82,10 +74,11 @@ class CurrentPriceSensor(CoordinatorEntity[EVChargeCoordinator], SensorEntity):
 
 
 class WeeklyScheduleSensor(CoordinatorEntity[EVChargeCoordinator], SensorEntity):
-    """Human-readable weekly charge schedule.
+    """Weekly charge schedule — readable summary.
 
-    State: short summary of next session.
-    Attributes: full list of planned sessions.
+    State: one-line description of what's happening / what's next.
+    Attributes: full list of sessions for the week, each showing which
+                individual slots were chosen and their prices.
     """
 
     _attr_has_entity_name = True
@@ -105,37 +98,40 @@ class WeeklyScheduleSensor(CoordinatorEntity[EVChargeCoordinator], SensorEntity)
     def extra_state_attributes(self) -> dict[str, Any]:
         if not self.coordinator.data:
             return {}
-        schedule = self.coordinator.data.get(DATA_SCHEDULE, [])
+        sessions = self.coordinator.data.get(DATA_SCHEDULE_SESSIONS, [])
         now = dt_util.utcnow()
-        sessions = []
-        for s in schedule:
+        out = []
+        for s in sessions:
             start_local = dt_util.as_local(s["start"])
             end_local = dt_util.as_local(s["end"])
-            diff_days = (start_local.date() - dt_util.as_local(now).date()).days
-            if diff_days == 0:
-                day_label = "Today"
-            elif diff_days == 1:
-                day_label = "Tomorrow"
+            diff = (start_local.date() - dt_util.as_local(now).date()).days
+            day = "Today" if diff == 0 else "Tomorrow" if diff == 1 else start_local.strftime("%A %-d %b")
+            if s["start"] <= now < s["end"]:
+                status = "active"
+            elif s["start"] > now:
+                status = "upcoming"
             else:
-                day_label = start_local.strftime("%A %-d %b")
-            sessions.append({
-                "day": day_label,
+                status = "past"
+            out.append({
+                "day": day,
                 "start": start_local.strftime("%H:%M"),
                 "end": end_local.strftime("%H:%M"),
+                "slots": s["n_slots"],
+                "duration_hours": round(s["n_slots"] * 0.5, 1),
                 "avg_price_p_kwh": s["avg_price"],
-                "duration_hours": s["duration_hours"],
-                "target_pct": s["target_pct"],
-                "prices_predicted": s.get("predicted", True),
-                "status": "active" if s["start"] <= now < s["end"] else "upcoming",
+                "cheapest_slot_p_kwh": s["min_price"],
+                "most_expensive_slot_p_kwh": s["max_price"],
+                "prices_predicted": s["predicted"],
+                "status": status,
             })
         return {
-            "sessions": sessions,
+            "sessions": out,
             "charging_now": self.coordinator.data.get(DATA_SCHEDULE_ACTIVE, False),
         }
 
 
 class NextChargeStartSensor(CoordinatorEntity[EVChargeCoordinator], SensorEntity):
-    """Timestamp of the next planned charge window start (for automations)."""
+    """Timestamp of next planned charge slot start."""
 
     _attr_has_entity_name = True
     _attr_name = "Next Charge Start"
@@ -153,7 +149,7 @@ class NextChargeStartSensor(CoordinatorEntity[EVChargeCoordinator], SensorEntity
 
 
 class NextChargeEndSensor(CoordinatorEntity[EVChargeCoordinator], SensorEntity):
-    """Timestamp of the next planned charge window end (for automations)."""
+    """Timestamp of next planned charge slot end."""
 
     _attr_has_entity_name = True
     _attr_name = "Next Charge End"

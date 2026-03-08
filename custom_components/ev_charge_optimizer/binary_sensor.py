@@ -1,7 +1,7 @@
 """Binary sensor platform for EV Charge Optimizer."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.config_entries import ConfigEntry
@@ -11,7 +11,7 @@ from homeassistant.helpers.event import async_track_point_in_time
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN, DATA_SCHEDULE
+from .const import DOMAIN, DATA_SCHEDULE_SLOTS
 from .coordinator import EVChargeCoordinator
 
 
@@ -25,10 +25,12 @@ async def async_setup_entry(
 
 
 class ChargeWindowSensor(CoordinatorEntity[EVChargeCoordinator], BinarySensorEntity):
-    """ON during every planned charge slot; OFF otherwise.
+    """ON during each individual planned 30-min charge slot; OFF otherwise.
 
-    Registers point-in-time callbacks at each window boundary so the entity
-    state changes at the exact 30-minute slot edge — safe to link to a charger switch.
+    The sensor registers a point-in-time callback at the START and END of every
+    scheduled slot so the state flips at the exact half-hour boundary.
+    Link this directly to your car charger switch — it turns on for cheap slots
+    and off for expensive ones, automatically throughout the week.
     """
 
     _attr_has_entity_name = True
@@ -57,20 +59,31 @@ class ChargeWindowSensor(CoordinatorEntity[EVChargeCoordinator], BinarySensorEnt
     async def async_will_remove_from_hass(self) -> None:
         self._cancel_timers()
 
+    # ------------------------------------------------------------------
+
     def _cancel_timers(self) -> None:
         for unsub in self._timer_unsubs:
             unsub()
         self._timer_unsubs.clear()
 
     def _reschedule_timers(self) -> None:
+        """Register a callback at the start AND end of every scheduled slot.
+
+        Each slot is 30 min. We register two callbacks per slot:
+          - at slot["datetime"]          → sensor turns ON
+          - at slot["datetime"] + 30min  → sensor turns OFF
+        This gives the charger an exact on/off signal at each half-hour boundary.
+        """
         self._cancel_timers()
         if not self.coordinator.data:
             return
-        schedule = self.coordinator.data.get(DATA_SCHEDULE, [])
+        slots = self.coordinator.data.get(DATA_SCHEDULE_SLOTS, [])
         now = dt_util.utcnow()
         seen: set[datetime] = set()
-        for window in schedule:
-            for boundary in (window["start"], window["end"]):
+        for slot in slots:
+            slot_start = slot["datetime"]
+            slot_end = slot_start + timedelta(minutes=30)
+            for boundary in (slot_start, slot_end):
                 if boundary > now and boundary not in seen:
                     seen.add(boundary)
                     self._timer_unsubs.append(
@@ -82,29 +95,36 @@ class ChargeWindowSensor(CoordinatorEntity[EVChargeCoordinator], BinarySensorEnt
         self.async_write_ha_state()
 
     def _boundary_reached(self, _now: datetime) -> None:
+        """Called at exact slot boundary — write new state immediately."""
         self.async_write_ha_state()
+
+    # ------------------------------------------------------------------
 
     @property
     def is_on(self) -> bool:
         if not self.coordinator.data:
             return False
-        schedule = self.coordinator.data.get(DATA_SCHEDULE, [])
+        slots = self.coordinator.data.get(DATA_SCHEDULE_SLOTS, [])
         now = dt_util.utcnow()
-        return any(w["start"] <= now < w["end"] for w in schedule)
+        return any(
+            s["datetime"] <= now < s["datetime"] + timedelta(minutes=30)
+            for s in slots
+        )
 
     @property
     def extra_state_attributes(self) -> dict:
         if not self.coordinator.data:
             return {}
-        schedule = self.coordinator.data.get(DATA_SCHEDULE, [])
+        slots = self.coordinator.data.get(DATA_SCHEDULE_SLOTS, [])
+        now = dt_util.utcnow()
         return {
-            "schedule": [
+            "scheduled_slots": [
                 {
-                    "start": w["start"].isoformat(),
-                    "end": w["end"].isoformat(),
-                    "avg_price_p_kwh": w["avg_price"],
-                    "duration_hours": w["duration_hours"],
+                    "time": dt_util.as_local(s["datetime"]).strftime("%a %d %b %H:%M"),
+                    "price_p_kwh": round(s["price"], 2),
+                    "status": "active" if s["datetime"] <= now < s["datetime"] + timedelta(minutes=30) else "upcoming",
                 }
-                for w in schedule
+                for s in slots
+                if s["datetime"] + timedelta(minutes=30) > now
             ]
         }
