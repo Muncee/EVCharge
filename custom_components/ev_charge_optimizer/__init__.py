@@ -12,12 +12,13 @@ from .coordinator import EVChargeCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = ["sensor", "binary_sensor"]
+PLATFORMS = ["sensor", "binary_sensor", "number"]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up EV Charge Optimizer from a config entry."""
-    coordinator = EVChargeCoordinator(hass, dict(entry.data))
+    config = {**entry.data, **entry.options}
+    coordinator = EVChargeCoordinator(hass, config)
     await coordinator.async_config_entry_first_refresh()
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator

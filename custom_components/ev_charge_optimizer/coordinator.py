@@ -57,6 +57,10 @@ from .const import (
     DATA_PRICES,
     DATA_LONG_EXPENSIVE_DAYS,
     DATA_CHARGE_NOW_BINARY,
+    DATA_NEXT_CHARGE_DATETIME,
+    DATA_NEXT_CHARGE_PRICE,
+    DATA_NEXT_CHARGE_TARGET_PCT,
+    DATA_SECOND_CHARGE_DATETIME,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -73,6 +77,8 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             update_interval=timedelta(minutes=UPDATE_INTERVAL_MINUTES),
         )
         self.config = config
+        # Runtime overrides set by number entities (min%, target%, daily usage)
+        self.overrides: dict[str, Any] = {}
 
     async def _async_update_data(self) -> dict[str, Any]:
         region = self.config[CONF_REGION]
@@ -196,12 +202,13 @@ class EVChargeCoordinator(DataUpdateCoordinator):
         now = dt_util.utcnow()
 
         battery_cap: float = self.config[CONF_BATTERY_CAPACITY]
-        daily_usage: float = self.config[CONF_DAILY_USAGE]
         charge_rate: float = self.config[CONF_CHARGE_RATE]
-        min_pct: float = self.config[CONF_MIN_CHARGE_PCT]
-        target_pct: float = self.config[CONF_TARGET_CHARGE_PCT]
         cheap_pct_threshold: float = self.config.get(CONF_CHEAP_PERCENTILE, 30)
         expensive_pct_threshold: float = self.config.get(CONF_EXPENSIVE_PERCENTILE, 70)
+        # These three can be overridden at runtime by number entities
+        daily_usage: float = float(self.overrides.get(CONF_DAILY_USAGE, self.config[CONF_DAILY_USAGE]))
+        min_pct: float = float(self.overrides.get(CONF_MIN_CHARGE_PCT, self.config[CONF_MIN_CHARGE_PCT]))
+        target_pct: float = float(self.overrides.get(CONF_TARGET_CHARGE_PCT, self.config[CONF_TARGET_CHARGE_PCT]))
 
         # If battery level unknown, assume at target
         if current_battery_pct is None:
@@ -315,6 +322,20 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             REC_CHARGE_NOW_MINIMUM,
         )
 
+        # Multi-day charge plan
+        next_charge_dt, next_charge_price, next_charge_target, second_charge_dt = (
+            self._plan_charge_sessions(
+                prices=prices,
+                current_battery_pct=current_battery_pct,
+                min_pct=min_pct,
+                target_pct=target_pct,
+                daily_usage=daily_usage,
+                battery_cap=battery_cap,
+                charge_rate=charge_rate,
+                now=now,
+            )
+        )
+
         return {
             DATA_RECOMMENDATION: recommendation,
             DATA_REASON: reason,
@@ -342,6 +363,10 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             DATA_LONG_EXPENSIVE_DAYS: round(long_expensive_days, 1),
             DATA_CHARGE_NOW_BINARY: charge_now_binary,
             DATA_PRICES: prices,
+            DATA_NEXT_CHARGE_DATETIME: next_charge_dt,
+            DATA_NEXT_CHARGE_PRICE: next_charge_price,
+            DATA_NEXT_CHARGE_TARGET_PCT: next_charge_target,
+            DATA_SECOND_CHARGE_DATETIME: second_charge_dt,
         }
 
     def _decide_strategy(
@@ -483,6 +508,66 @@ class EVChargeCoordinator(DataUpdateCoordinator):
     # Helpers
     # ------------------------------------------------------------------
 
+    def _plan_charge_sessions(
+        self,
+        prices: list[dict],
+        current_battery_pct: float,
+        min_pct: float,
+        target_pct: float,
+        daily_usage: float,
+        battery_cap: float,
+        charge_rate: float,
+        now: datetime,
+    ) -> tuple:
+        """Calculate optimal timing for the next two charge sessions.
+
+        Returns (next_charge_dt, next_charge_price, next_charge_target_pct, second_charge_dt).
+        """
+        if daily_usage <= 0:
+            return None, None, None, None
+
+        current_kwh = (current_battery_pct / 100) * battery_cap
+        min_kwh = (min_pct / 100) * battery_cap
+        target_kwh = (target_pct / 100) * battery_cap
+        hours_to_charge = max(0.5, (target_kwh - min_kwh) / charge_rate)
+
+        # Session 1: find cheapest slot before battery hits minimum
+        usable_kwh = max(0.0, current_kwh - min_kwh)
+        hours_of_range = (usable_kwh / daily_usage) * 24
+        must_charge_by = now + timedelta(hours=hours_of_range)
+        # Latest we can start charging and still finish before must_charge_by
+        latest_start = must_charge_by - timedelta(hours=hours_to_charge)
+
+        future_slots = [s for s in prices if s["datetime"] > now]
+        candidates = [s for s in future_slots if s["datetime"] <= latest_start]
+        if not candidates:
+            # Battery needs charging soon; pick cheapest immediately available slot
+            candidates = future_slots[:8]
+        if not candidates:
+            return None, None, None, None
+
+        optimal = min(candidates, key=lambda x: x["price"])
+
+        # Session 2: after charging to target at session 1, find next optimal window
+        post_charge_kwh = target_kwh
+        usable_kwh_2 = max(0.0, post_charge_kwh - min_kwh)
+        hours_of_range_2 = (usable_kwh_2 / daily_usage) * 24
+        must_charge_by_2 = optimal["datetime"] + timedelta(hours=hours_of_range_2)
+        latest_start_2 = must_charge_by_2 - timedelta(hours=hours_to_charge)
+
+        candidates_2 = [
+            s for s in future_slots
+            if optimal["datetime"] < s["datetime"] <= latest_start_2
+        ]
+        second_optimal = min(candidates_2, key=lambda x: x["price"]) if candidates_2 else None
+
+        return (
+            optimal["datetime"],
+            round(optimal["price"], 2),
+            target_pct,
+            second_optimal["datetime"] if second_optimal else None,
+        )
+
     def _longest_consecutive_expensive(self, future_slots: list[dict]) -> float:
         """Return length in days of the longest consecutive run of expensive slots."""
         max_run = 0
@@ -533,4 +618,8 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             DATA_LONG_EXPENSIVE_DAYS: None,
             DATA_CHARGE_NOW_BINARY: False,
             DATA_PRICES: [],
+            DATA_NEXT_CHARGE_DATETIME: None,
+            DATA_NEXT_CHARGE_PRICE: None,
+            DATA_NEXT_CHARGE_TARGET_PCT: None,
+            DATA_SECOND_CHARGE_DATETIME: None,
         }

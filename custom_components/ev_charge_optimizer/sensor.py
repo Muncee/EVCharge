@@ -47,6 +47,10 @@ from .const import (
     DATA_CHEAPEST_UPCOMING_PRICE,
     DATA_CHEAPEST_UPCOMING_START,
     DATA_LONG_EXPENSIVE_DAYS,
+    DATA_NEXT_CHARGE_DATETIME,
+    DATA_NEXT_CHARGE_PRICE,
+    DATA_NEXT_CHARGE_TARGET_PCT,
+    DATA_SECOND_CHARGE_DATETIME,
 )
 from .coordinator import EVChargeCoordinator
 
@@ -234,6 +238,36 @@ SENSOR_DESCRIPTIONS: tuple[EVSensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:weather-sunny-alert",
         data_key=DATA_LONG_EXPENSIVE_DAYS,
+    ),
+    EVSensorDescription(
+        key="next_charge_datetime",
+        name="Optimal Next Charge Time",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        icon="mdi:calendar-clock",
+        data_key=DATA_NEXT_CHARGE_DATETIME,
+    ),
+    EVSensorDescription(
+        key="next_charge_price",
+        name="Price at Next Optimal Charge",
+        native_unit_of_measurement=PENCE_PER_KWH,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:tag-outline",
+        data_key=DATA_NEXT_CHARGE_PRICE,
+    ),
+    EVSensorDescription(
+        key="next_charge_target_pct",
+        name="Next Charge Target Level",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:battery-charging-100",
+        data_key=DATA_NEXT_CHARGE_TARGET_PCT,
+    ),
+    EVSensorDescription(
+        key="second_charge_datetime",
+        name="Estimated Second Charge Time",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        icon="mdi:calendar-clock-outline",
+        data_key=DATA_SECOND_CHARGE_DATETIME,
     ),
 )
 

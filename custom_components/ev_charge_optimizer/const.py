@@ -71,3 +71,9 @@ DATA_CHEAPEST_UPCOMING_START = "cheapest_upcoming_start"
 DATA_PRICES = "prices"
 DATA_LONG_EXPENSIVE_DAYS = "long_expensive_days"
 DATA_CHARGE_NOW_BINARY = "charge_now"
+
+# Multi-day charge planning
+DATA_NEXT_CHARGE_DATETIME = "next_charge_datetime"
+DATA_NEXT_CHARGE_PRICE = "next_charge_price"
+DATA_NEXT_CHARGE_TARGET_PCT = "next_charge_target_pct"
+DATA_SECOND_CHARGE_DATETIME = "second_charge_datetime"
