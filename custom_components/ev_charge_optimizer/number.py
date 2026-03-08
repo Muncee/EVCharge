@@ -10,24 +10,12 @@ from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const import (
     DOMAIN,
-    CONF_MIN_CHARGE_PCT,
     CONF_TARGET_CHARGE_PCT,
     CONF_DAILY_USAGE,
 )
 from .coordinator import EVChargeCoordinator
 
 _NUMBER_DEFS = (
-    {
-        "key": "min_charge_pct",
-        "name": "Minimum Charge Level",
-        "icon": "mdi:battery-low",
-        "unit": PERCENTAGE,
-        "min": 5.0,
-        "max": 50.0,
-        "step": 1.0,
-        "config_key": CONF_MIN_CHARGE_PCT,
-        "default": 20.0,
-    },
     {
         "key": "target_charge_pct",
         "name": "Target Charge Level",

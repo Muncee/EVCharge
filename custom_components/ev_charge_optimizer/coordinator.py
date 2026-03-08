@@ -21,14 +21,10 @@ from .const import (
     CONF_BATTERY_CAPACITY,
     CONF_DAILY_USAGE,
     CONF_CHARGE_RATE,
-    CONF_MIN_CHARGE_PCT,
     CONF_TARGET_CHARGE_PCT,
     CONF_BATTERY_ENTITY,
-    CONF_CHEAP_PERCENTILE,
-    CONF_EXPENSIVE_PERCENTILE,
     REC_CHARGE_NOW_FULLY,
     REC_CHARGE_NOW_MINIMUM,
-    REC_CHARGE_DAILY,
     REC_WAIT,
     REC_UNKNOWN,
     DATA_RECOMMENDATION,
@@ -196,6 +192,9 @@ class EVChargeCoordinator(DataUpdateCoordinator):
     # Strategy
     # ------------------------------------------------------------------
 
+    # Hard-coded safety buffer — battery below this = must charge now
+    _SAFETY_PCT = 10.0
+
     def _compute_strategy(
         self, prices: list[dict], current_battery_pct: float | None
     ) -> dict[str, Any]:
@@ -203,43 +202,51 @@ class EVChargeCoordinator(DataUpdateCoordinator):
 
         battery_cap: float = self.config[CONF_BATTERY_CAPACITY]
         charge_rate: float = self.config[CONF_CHARGE_RATE]
-        cheap_pct_threshold: float = self.config.get(CONF_CHEAP_PERCENTILE, 30)
-        expensive_pct_threshold: float = self.config.get(CONF_EXPENSIVE_PERCENTILE, 70)
-        # These three can be overridden at runtime by number entities
+        # These two can be overridden at runtime by number entities
         daily_usage: float = float(self.overrides.get(CONF_DAILY_USAGE, self.config[CONF_DAILY_USAGE]))
-        min_pct: float = float(self.overrides.get(CONF_MIN_CHARGE_PCT, self.config[CONF_MIN_CHARGE_PCT]))
         target_pct: float = float(self.overrides.get(CONF_TARGET_CHARGE_PCT, self.config[CONF_TARGET_CHARGE_PCT]))
 
         # If battery level unknown, assume at target
         if current_battery_pct is None:
             current_battery_pct = target_pct
 
-        all_price_values = [s["price"] for s in prices]
-        if not all_price_values:
+        # ---------------------------------------------------------------
+        # Price analysis — use only future prices vs the 14-day window
+        # ---------------------------------------------------------------
+        future_slots = [s for s in prices if s["datetime"] > now]
+        if not future_slots:
             return self._unknown_result()
 
-        sorted_prices_vals = sorted(all_price_values)
-        cheap_threshold = self._percentile(sorted_prices_vals, cheap_pct_threshold)
-        expensive_threshold = self._percentile(sorted_prices_vals, expensive_pct_threshold)
-        avg_price = statistics.mean(all_price_values)
+        current_slot = next(
+            (s for s in prices if s["datetime"] <= now < s["datetime"] + timedelta(minutes=30)),
+            None,
+        )
+        current_price = current_slot["price"] if current_slot else future_slots[0]["price"]
 
-        # Label slots
+        # Up to 14 days of future prices for percentile/rank analysis
+        analysis_slots = future_slots[: 14 * 48]
+        analysis_prices_vals = [s["price"] for s in analysis_slots]
+        sorted_analysis = sorted(analysis_prices_vals)
+        avg_price = statistics.mean(analysis_prices_vals)
+
+        # Fixed thresholds (bottom 20% = cheap, top 25% = expensive)
+        cheap_threshold = self._percentile(sorted_analysis, 20)
+        expensive_threshold = self._percentile(sorted_analysis, 75)
+
+        # Where does current price rank in next 14 days? (0 = cheapest, 1 = most expensive)
+        current_rank = (
+            sum(1 for p in sorted_analysis if p <= current_price) / len(sorted_analysis)
+            if sorted_analysis
+            else 0.5
+        )
+
+        # Label slots for binary sensor / next cheap window
         for slot in prices:
             slot["cheap"] = slot["price"] <= cheap_threshold
             slot["expensive"] = slot["price"] >= expensive_threshold
 
-        # Current slot
-        current_slot = next(
-            (
-                s for s in prices
-                if s["datetime"] <= now < s["datetime"] + timedelta(minutes=30)
-            ),
-            None,
-        )
-        current_price = current_slot["price"] if current_slot else all_price_values[0]
-
-        # Future slots
-        future_slots = [s for s in prices if s["datetime"] > now]
+        is_cheap_now = current_price <= cheap_threshold
+        is_expensive_now = current_price >= expensive_threshold
         next_cheap_slot = next((s for s in future_slots if s["cheap"]), None)
         hours_until_cheap = (
             (next_cheap_slot["datetime"] - now).total_seconds() / 3600
@@ -247,87 +254,81 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             else None
         )
 
-        # Battery kWh
+        # ---------------------------------------------------------------
+        # Battery metrics — safety buffer is always 10%
+        # ---------------------------------------------------------------
+        safety_kwh = (self._SAFETY_PCT / 100) * battery_cap
         current_kwh = (current_battery_pct / 100) * battery_cap
         target_kwh = (target_pct / 100) * battery_cap
-        min_kwh = (min_pct / 100) * battery_cap
         kwh_needed = max(0.0, target_kwh - current_kwh)
         hours_to_charge = kwh_needed / charge_rate if charge_rate > 0 else 0.0
 
-        # Battery range before hitting minimum
-        usable_kwh = max(0.0, current_kwh - min_kwh)
-        days_of_range = usable_kwh / daily_usage if daily_usage > 0 else 999
-        hours_until_min = days_of_range * 24
+        usable_kwh = max(0.0, current_kwh - safety_kwh)
+        days_of_range = usable_kwh / daily_usage if daily_usage > 0 else 999.0
+        hours_of_range = days_of_range * 24
 
-        # Expensive period analysis over next 7 days
-        slots_7day = [
-            s for s in future_slots if s["datetime"] < now + timedelta(days=7)
-        ]
-        pct_expensive_7day = (
-            sum(1 for s in slots_7day if s["expensive"]) / len(slots_7day)
-            if slots_7day
+        # ---------------------------------------------------------------
+        # Cheapest slot within battery range
+        # ---------------------------------------------------------------
+        must_charge_by = now + timedelta(hours=hours_of_range)
+        latest_start = must_charge_by - timedelta(hours=max(hours_to_charge, 0.5))
+        reachable_slots = [s for s in future_slots if s["datetime"] <= latest_start]
+        cheapest_within_range = (
+            min(reachable_slots, key=lambda x: x["price"]) if reachable_slots else None
+        )
+
+        # ---------------------------------------------------------------
+        # Upcoming expensive period analysis (vs median, not a fixed threshold)
+        # ---------------------------------------------------------------
+        median_price = self._percentile(sorted_analysis, 50)
+        upcoming_7day = [s for s in future_slots if s["datetime"] < now + timedelta(days=7)]
+        pct_above_median_7day = (
+            sum(1 for s in upcoming_7day if s["price"] > median_price) / len(upcoming_7day)
+            if upcoming_7day
             else 0.0
         )
-
-        # Find longest consecutive expensive block (in days)
         long_expensive_days = self._longest_consecutive_expensive(future_slots)
 
-        # Today's cheapest slot
+        # ---------------------------------------------------------------
+        # Today's cheapest + globally cheapest upcoming
+        # ---------------------------------------------------------------
         today_midnight = now.replace(hour=23, minute=59, second=59, microsecond=0)
         today_slots = [s for s in prices if now <= s["datetime"] <= today_midnight]
-        cheapest_today = (
-            min(today_slots, key=lambda x: x["price"]) if today_slots else None
-        )
-
-        # Cheapest slot across all future prices
-        cheapest_upcoming = (
-            min(future_slots, key=lambda x: x["price"]) if future_slots else None
-        )
-
-        is_cheap_now = current_price <= cheap_threshold
-        is_expensive_now = current_price >= expensive_threshold
+        cheapest_today = min(today_slots, key=lambda x: x["price"]) if today_slots else None
+        cheapest_upcoming = min(future_slots, key=lambda x: x["price"]) if future_slots else None
 
         # ---------------------------------------------------------------
         # Cost estimates
         # ---------------------------------------------------------------
-        cost_now = round(current_price * kwh_needed / 100, 2)  # £
+        cost_now = round(current_price * kwh_needed / 100, 2)
         cost_cheapest_today = round(
-            (cheapest_today["price"] * kwh_needed / 100) if cheapest_today else cost_now,
-            2,
+            cheapest_today["price"] * kwh_needed / 100 if cheapest_today else cost_now, 2
         )
         estimated_savings = round(max(0.0, cost_now - cost_cheapest_today), 2)
 
         # ---------------------------------------------------------------
-        # Strategy decision
+        # Decision
         # ---------------------------------------------------------------
         recommendation, reason = self._decide_strategy(
-            is_cheap_now=is_cheap_now,
-            is_expensive_now=is_expensive_now,
             current_price=current_price,
+            current_rank=current_rank,
             kwh_needed=kwh_needed,
-            pct_expensive_7day=pct_expensive_7day,
-            long_expensive_days=long_expensive_days,
-            hours_until_cheap=hours_until_cheap,
-            hours_until_min=hours_until_min,
-            next_cheap_slot=next_cheap_slot,
             current_battery_pct=current_battery_pct,
             target_pct=target_pct,
-            min_pct=min_pct,
+            days_of_range=days_of_range,
+            cheapest_within_range=cheapest_within_range,
+            pct_above_median_7day=pct_above_median_7day,
             avg_price=avg_price,
-            cheap_threshold=cheap_threshold,
+            now=now,
         )
 
-        charge_now_binary = recommendation in (
-            REC_CHARGE_NOW_FULLY,
-            REC_CHARGE_NOW_MINIMUM,
-        )
+        charge_now_binary = recommendation in (REC_CHARGE_NOW_FULLY, REC_CHARGE_NOW_MINIMUM)
 
         # Multi-day charge plan
         next_charge_dt, next_charge_price, next_charge_target, second_charge_dt = (
             self._plan_charge_sessions(
                 prices=prices,
                 current_battery_pct=current_battery_pct,
-                min_pct=min_pct,
                 target_pct=target_pct,
                 daily_usage=daily_usage,
                 battery_cap=battery_cap,
@@ -355,7 +356,7 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             DATA_COST_CHEAPEST: cost_cheapest_today,
             DATA_ESTIMATED_SAVINGS: estimated_savings,
             DATA_DAYS_OF_RANGE: round(days_of_range, 1),
-            DATA_PCT_EXPENSIVE_7DAYS: round(pct_expensive_7day * 100, 0),
+            DATA_PCT_EXPENSIVE_7DAYS: round(pct_above_median_7day * 100, 0),
             DATA_CHEAPEST_TODAY_PRICE: round(cheapest_today["price"], 2) if cheapest_today else None,
             DATA_CHEAPEST_TODAY_START: cheapest_today["datetime"] if cheapest_today else None,
             DATA_CHEAPEST_UPCOMING_PRICE: round(cheapest_upcoming["price"], 2) if cheapest_upcoming else None,
@@ -372,136 +373,74 @@ class EVChargeCoordinator(DataUpdateCoordinator):
     def _decide_strategy(
         self,
         *,
-        is_cheap_now: bool,
-        is_expensive_now: bool,
         current_price: float,
+        current_rank: float,
         kwh_needed: float,
-        pct_expensive_7day: float,
-        long_expensive_days: float,
-        hours_until_cheap: float | None,
-        hours_until_min: float,
-        next_cheap_slot: dict | None,
         current_battery_pct: float,
         target_pct: float,
-        min_pct: float,
+        days_of_range: float,
+        cheapest_within_range: dict | None,
+        pct_above_median_7day: float,
         avg_price: float,
-        cheap_threshold: float,
+        now: datetime,
     ) -> tuple[str, str]:
         """
-        Decision tree for charging recommendation.
+        Decide whether to charge now, wait, or do nothing.
 
-        Priority order:
-        1. Battery critically low -> charge now regardless of price
-        2. Cheap now + long expensive period coming -> charge fully now
-        3. Cheap now + prices generally stable -> charge daily
-        4. Expensive now + cheap window soon + battery has range -> wait
-        5. Expensive now + battery low -> charge minimum
-        6. Moderate price + expensive period approaching -> charge minimum
-        7. Default -> charge daily
+        current_rank: 0.0 = cheapest slot in next 14 days, 1.0 = most expensive.
         """
-
-        # 1. Battery critically low - must charge now
-        if current_battery_pct <= min_pct:
+        # 1. Battery critically low — charge regardless of price
+        if current_battery_pct <= self._SAFETY_PCT + 5:
             return (
                 REC_CHARGE_NOW_MINIMUM,
-                (
-                    f"Battery is at {current_battery_pct:.0f}%, at or below the minimum "
-                    f"threshold of {min_pct:.0f}%. Charging now regardless of price "
-                    f"({current_price:.1f}p/kWh)."
-                ),
+                f"Battery is critically low at {current_battery_pct:.0f}% — "
+                f"charge now ({current_price:.1f}p/kWh) to avoid running out.",
             )
 
-        # 2. Cheap now + significant expensive period coming -> charge fully
-        if is_cheap_now and kwh_needed > 0 and pct_expensive_7day >= 0.35 and long_expensive_days >= 1.5:
+        # 2. Opportunistic top-up: price is in the bottom 15% of next 14 days
+        #    AND an expensive period dominates the next 7 days.
+        #    Recommend charging even if battery isn't low.
+        if current_rank <= 0.15 and kwh_needed > 0 and pct_above_median_7day >= 0.60:
+            savings = round((avg_price - current_price) * kwh_needed / 100, 2)
+            rank_pct = max(1, int(current_rank * 100))
             return (
                 REC_CHARGE_NOW_FULLY,
-                (
-                    f"Prices are cheap now ({current_price:.1f}p/kWh, below the "
-                    f"{cheap_threshold:.1f}p/kWh cheap threshold). "
-                    f"{pct_expensive_7day * 100:.0f}% of the next 7 days will be expensive, "
-                    f"with up to {long_expensive_days:.1f} consecutive expensive days. "
-                    f"Recommend charging to {target_pct:.0f}% now to avoid high future costs."
-                ),
+                f"Charge now — prices are in the cheapest {rank_pct}% of the next 2 weeks "
+                f"({current_price:.1f}p/kWh vs {avg_price:.1f}p average). "
+                f"Expensive prices expected for most of the next 7 days. "
+                f"Charging to {target_pct:.0f}% now saves ~£{savings:.2f} vs waiting.",
             )
 
-        # 3. Cheap now + upcoming prices also reasonable -> charge daily
-        if is_cheap_now:
-            return (
-                REC_CHARGE_DAILY,
-                (
-                    f"Prices are cheap now ({current_price:.1f}p/kWh) and upcoming prices "
-                    f"are generally reasonable (only {pct_expensive_7day * 100:.0f}% of the "
-                    f"next 7 days are expensive). Charge daily during the cheapest windows "
-                    f"rather than filling up now."
-                ),
-            )
-
-        # 4. Not cheap now, but cheap window is coming soon and battery can wait
-        if (
-            hours_until_cheap is not None
-            and hours_until_cheap <= 8
-            and hours_until_min > hours_until_cheap + 1
-        ):
-            return (
-                REC_WAIT,
-                (
-                    f"Current price is {current_price:.1f}p/kWh. A cheaper window "
-                    f"({next_cheap_slot['price']:.1f}p/kWh) starts in "
-                    f"{hours_until_cheap:.1f} hours. Your battery has enough range "
-                    f"to wait ({hours_until_min:.1f}h until minimum level)."
-                ),
-            )
-
-        # 5. Cheap window is many hours away but battery can wait - still worth waiting
-        if (
-            hours_until_cheap is not None
-            and hours_until_cheap <= 24
-            and hours_until_min > hours_until_cheap + 2
-            and not is_expensive_now
-        ):
-            return (
-                REC_WAIT,
-                (
-                    f"Current price ({current_price:.1f}p/kWh) is above the cheap threshold "
-                    f"({cheap_threshold:.1f}p/kWh). A cheaper window starts in "
-                    f"{hours_until_cheap:.1f}h at {next_cheap_slot['price']:.1f}p/kWh. "
-                    f"Battery range is sufficient to wait."
-                ),
-            )
-
-        # 6. Expensive now, battery can't wait, or no cheap window soon -> charge minimum
-        if is_expensive_now or (
-            hours_until_cheap is not None and hours_until_min <= hours_until_cheap
-        ):
+        # 3. Battery won't reach any cheaper slot — charge now at current price
+        if cheapest_within_range is None:
             return (
                 REC_CHARGE_NOW_MINIMUM,
-                (
-                    f"Prices are {'high' if is_expensive_now else 'moderate'} "
-                    f"({current_price:.1f}p/kWh) and battery needs topping up "
-                    f"(only {hours_until_min:.1f}h of range remaining before hitting "
-                    f"the {min_pct:.0f}% minimum). Charging to minimum now."
-                ),
+                f"Charge now — battery won't last until the next cheap period "
+                f"(only {days_of_range:.1f} days of range left). "
+                f"Current price: {current_price:.1f}p/kWh.",
             )
 
-        # 7. Moderate prices, expensive period approaching -> top up to minimum
-        if pct_expensive_7day >= 0.25:
+        # 4. Current price is the cheapest (or within 10%) of anything reachable
+        if current_price <= cheapest_within_range["price"] * 1.10 and kwh_needed > 0:
+            savings = round((avg_price - current_price) * kwh_needed / 100, 2)
             return (
-                REC_CHARGE_NOW_MINIMUM,
-                (
-                    f"Current price is moderate ({current_price:.1f}p/kWh) with "
-                    f"{pct_expensive_7day * 100:.0f}% of the next 7 days expected to be "
-                    f"expensive. Topping up to minimum level as a precaution."
-                ),
+                REC_CHARGE_NOW_FULLY,
+                f"Good time to charge — {current_price:.1f}p/kWh is the cheapest available "
+                f"in the next {days_of_range:.1f} days "
+                f"(14-day average: {avg_price:.1f}p/kWh).",
             )
 
-        # 8. Default: charge daily during cheapest available windows
+        # 5. A meaningfully cheaper slot is coming within battery range — wait
+        wait_dt = cheapest_within_range["datetime"]
+        wait_price = cheapest_within_range["price"]
+        when = self._format_wait_time(wait_dt, now)
+        savings = round((current_price - wait_price) * kwh_needed / 100, 2) if kwh_needed > 0 else 0.0
+        savings_str = f", saves ~£{savings:.2f}" if savings > 0.01 else ""
         return (
-            REC_CHARGE_DAILY,
-            (
-                f"Prices are moderate ({current_price:.1f}p/kWh, average "
-                f"{avg_price:.1f}p/kWh over 14 days). Continue your normal daily "
-                f"charging schedule, targeting the cheapest overnight windows."
-            ),
+            REC_WAIT,
+            f"Wait until {when} — {wait_price:.1f}p/kWh vs {current_price:.1f}p now"
+            f"{savings_str}. "
+            f"Your battery will last {days_of_range:.1f} days.",
         )
 
     # ------------------------------------------------------------------
@@ -512,7 +451,6 @@ class EVChargeCoordinator(DataUpdateCoordinator):
         self,
         prices: list[dict],
         current_battery_pct: float,
-        min_pct: float,
         target_pct: float,
         daily_usage: float,
         battery_cap: float,
@@ -526,31 +464,28 @@ class EVChargeCoordinator(DataUpdateCoordinator):
         if daily_usage <= 0:
             return None, None, None, None
 
+        safety_kwh = (self._SAFETY_PCT / 100) * battery_cap
         current_kwh = (current_battery_pct / 100) * battery_cap
-        min_kwh = (min_pct / 100) * battery_cap
         target_kwh = (target_pct / 100) * battery_cap
-        hours_to_charge = max(0.5, (target_kwh - min_kwh) / charge_rate)
+        hours_to_charge = max(0.5, (target_kwh - safety_kwh) / charge_rate)
 
-        # Session 1: find cheapest slot before battery hits minimum
-        usable_kwh = max(0.0, current_kwh - min_kwh)
+        # Session 1: find cheapest slot before battery hits safety level
+        usable_kwh = max(0.0, current_kwh - safety_kwh)
         hours_of_range = (usable_kwh / daily_usage) * 24
         must_charge_by = now + timedelta(hours=hours_of_range)
-        # Latest we can start charging and still finish before must_charge_by
         latest_start = must_charge_by - timedelta(hours=hours_to_charge)
 
         future_slots = [s for s in prices if s["datetime"] > now]
         candidates = [s for s in future_slots if s["datetime"] <= latest_start]
         if not candidates:
-            # Battery needs charging soon; pick cheapest immediately available slot
             candidates = future_slots[:8]
         if not candidates:
             return None, None, None, None
 
         optimal = min(candidates, key=lambda x: x["price"])
 
-        # Session 2: after charging to target at session 1, find next optimal window
-        post_charge_kwh = target_kwh
-        usable_kwh_2 = max(0.0, post_charge_kwh - min_kwh)
+        # Session 2: after charging to target at session 1
+        usable_kwh_2 = max(0.0, target_kwh - safety_kwh)
         hours_of_range_2 = (usable_kwh_2 / daily_usage) * 24
         must_charge_by_2 = optimal["datetime"] + timedelta(hours=hours_of_range_2)
         latest_start_2 = must_charge_by_2 - timedelta(hours=hours_to_charge)
@@ -567,6 +502,18 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             target_pct,
             second_optimal["datetime"] if second_optimal else None,
         )
+
+    def _format_wait_time(self, dt: datetime, now: datetime) -> str:
+        """Format a future datetime as e.g. 'today at 06:30', 'tomorrow at 14:00', 'Friday at 02:00'."""
+        local_dt = dt_util.as_local(dt)
+        local_now = dt_util.as_local(now)
+        diff_days = (local_dt.date() - local_now.date()).days
+        time_str = local_dt.strftime("%H:%M")
+        if diff_days == 0:
+            return f"today at {time_str}"
+        if diff_days == 1:
+            return f"tomorrow at {time_str}"
+        return f"{local_dt.strftime('%A')} at {time_str}"
 
     def _longest_consecutive_expensive(self, future_slots: list[dict]) -> float:
         """Return length in days of the longest consecutive run of expensive slots."""

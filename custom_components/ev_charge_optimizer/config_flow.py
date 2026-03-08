@@ -16,11 +16,8 @@ from .const import (
     CONF_BATTERY_CAPACITY,
     CONF_DAILY_USAGE,
     CONF_CHARGE_RATE,
-    CONF_MIN_CHARGE_PCT,
     CONF_TARGET_CHARGE_PCT,
     CONF_BATTERY_ENTITY,
-    CONF_CHEAP_PERCENTILE,
-    CONF_EXPENSIVE_PERCENTILE,
     API_BASE_URL,
     OCTOPUS_REGIONS,
 )
@@ -60,13 +57,6 @@ def _base_schema(defaults: dict) -> vol.Schema:
                 )
             ),
             vol.Required(
-                CONF_MIN_CHARGE_PCT, default=defaults.get(CONF_MIN_CHARGE_PCT, 20)
-            ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=5, max=50, step=1, unit_of_measurement="%", mode=selector.NumberSelectorMode.SLIDER
-                )
-            ),
-            vol.Required(
                 CONF_TARGET_CHARGE_PCT, default=defaults.get(CONF_TARGET_CHARGE_PCT, 80)
             ): selector.NumberSelector(
                 selector.NumberSelectorConfig(
@@ -77,20 +67,6 @@ def _base_schema(defaults: dict) -> vol.Schema:
                 CONF_BATTERY_ENTITY, default=defaults.get(CONF_BATTERY_ENTITY, "")
             ): selector.EntitySelector(
                 selector.EntitySelectorConfig(domain="sensor")
-            ),
-            vol.Required(
-                CONF_CHEAP_PERCENTILE, default=defaults.get(CONF_CHEAP_PERCENTILE, 30)
-            ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=10, max=50, step=5, unit_of_measurement="%", mode=selector.NumberSelectorMode.SLIDER
-                )
-            ),
-            vol.Required(
-                CONF_EXPENSIVE_PERCENTILE, default=defaults.get(CONF_EXPENSIVE_PERCENTILE, 70)
-            ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=50, max=90, step=5, unit_of_measurement="%", mode=selector.NumberSelectorMode.SLIDER
-                )
             ),
         }
     )
