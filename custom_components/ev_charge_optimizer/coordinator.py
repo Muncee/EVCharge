@@ -194,6 +194,10 @@ class EVChargeCoordinator(DataUpdateCoordinator):
 
     # Hard-coded safety buffer — battery below this = must charge now
     _SAFETY_PCT = 10.0
+    # Truly empty — charge regardless of price
+    _CRITICAL_PCT = 5.0
+    # Only recommend waiting if the upcoming slot is at least this much cheaper
+    _WAIT_SAVING_THRESHOLD = 0.80  # 20% cheaper
 
     def _compute_strategy(
         self, prices: list[dict], current_battery_pct: float | None
@@ -278,6 +282,12 @@ class EVChargeCoordinator(DataUpdateCoordinator):
         )
 
         # ---------------------------------------------------------------
+        # Cheapest slot in the next 24 hours (parked-car lookahead)
+        # ---------------------------------------------------------------
+        slots_24h = [s for s in future_slots if s["datetime"] < now + timedelta(hours=24)]
+        cheapest_24h = min(slots_24h, key=lambda x: x["price"]) if slots_24h else None
+
+        # ---------------------------------------------------------------
         # Upcoming expensive period analysis (vs median, not a fixed threshold)
         # ---------------------------------------------------------------
         median_price = self._percentile(sorted_analysis, 50)
@@ -317,6 +327,7 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             target_pct=target_pct,
             days_of_range=days_of_range,
             cheapest_within_range=cheapest_within_range,
+            cheapest_24h=cheapest_24h,
             pct_above_median_7day=pct_above_median_7day,
             avg_price=avg_price,
             now=now,
@@ -380,6 +391,7 @@ class EVChargeCoordinator(DataUpdateCoordinator):
         target_pct: float,
         days_of_range: float,
         cheapest_within_range: dict | None,
+        cheapest_24h: dict | None,
         pct_above_median_7day: float,
         avg_price: float,
         now: datetime,
@@ -387,19 +399,47 @@ class EVChargeCoordinator(DataUpdateCoordinator):
         """
         Decide whether to charge now, wait, or do nothing.
 
+        Key design principle: the car is parked most of the time. The battery
+        depletion rate (daily_usage) does NOT apply while parked, so we should
+        not use it to gate whether waiting is possible. Instead we always check
+        the next 24 hours for a cheaper slot first.
+
         current_rank: 0.0 = cheapest slot in next 14 days, 1.0 = most expensive.
         """
-        # 1. Battery critically low — charge regardless of price
-        if current_battery_pct <= self._SAFETY_PCT + 5:
+        def _wait_msg(slot: dict, note: str) -> tuple[str, str]:
+            wait_price = slot["price"]
+            when = self._format_wait_time(slot["datetime"], now)
+            savings = round((current_price - wait_price) * kwh_needed / 100, 2) if kwh_needed > 0 else 0.0
+            savings_str = f", saves ~£{savings:.2f}" if savings > 0.01 else ""
+            return (
+                REC_WAIT,
+                f"Wait until {when} — {wait_price:.1f}p/kWh vs {current_price:.1f}p now"
+                f"{savings_str}. {note}",
+            )
+
+        # 1. Truly empty — must charge immediately regardless of price
+        if current_battery_pct <= self._CRITICAL_PCT:
             return (
                 REC_CHARGE_NOW_MINIMUM,
                 f"Battery is critically low at {current_battery_pct:.0f}% — "
-                f"charge now ({current_price:.1f}p/kWh) to avoid running out.",
+                f"charge now ({current_price:.1f}p/kWh) before it runs out completely.",
             )
 
-        # 2. Opportunistic top-up: price is in the bottom 15% of next 14 days
-        #    AND an expensive period dominates the next 7 days.
-        #    Recommend charging even if battery isn't low.
+        # 2. Cheap slot coming within 24 hours that's at least 20% cheaper than now.
+        #    The car is likely parked — always worth waiting even with a low battery.
+        if (
+            cheapest_24h is not None
+            and cheapest_24h["price"] < current_price * self._WAIT_SAVING_THRESHOLD
+        ):
+            low_note = (
+                f"Battery is low ({current_battery_pct:.0f}%) — don't drive far before then."
+                if current_battery_pct < 25
+                else f"Your battery will last {days_of_range:.1f} days."
+            )
+            return _wait_msg(cheapest_24h, low_note)
+
+        # 3. Opportunistic top-up: prices are in the bottom 15% of the next 2 weeks
+        #    AND an expensive period dominates the coming week.
         if current_rank <= 0.15 and kwh_needed > 0 and pct_above_median_7day >= 0.60:
             savings = round((avg_price - current_price) * kwh_needed / 100, 2)
             rank_pct = max(1, int(current_rank * 100))
@@ -411,18 +451,12 @@ class EVChargeCoordinator(DataUpdateCoordinator):
                 f"Charging to {target_pct:.0f}% now saves ~£{savings:.2f} vs waiting.",
             )
 
-        # 3. Battery won't reach any cheaper slot — charge now at current price
-        if cheapest_within_range is None:
-            return (
-                REC_CHARGE_NOW_MINIMUM,
-                f"Charge now — battery won't last until the next cheap period "
-                f"(only {days_of_range:.1f} days of range left). "
-                f"Current price: {current_price:.1f}p/kWh.",
-            )
-
-        # 4. Current price is the cheapest (or within 10%) of anything reachable
-        if current_price <= cheapest_within_range["price"] * 1.10 and kwh_needed > 0:
-            savings = round((avg_price - current_price) * kwh_needed / 100, 2)
+        # 4. Now is the cheapest (or near-cheapest) slot within battery driving range
+        if (
+            cheapest_within_range is not None
+            and current_price <= cheapest_within_range["price"] * 1.10
+            and kwh_needed > 0
+        ):
             return (
                 REC_CHARGE_NOW_FULLY,
                 f"Good time to charge — {current_price:.1f}p/kWh is the cheapest available "
@@ -430,17 +464,18 @@ class EVChargeCoordinator(DataUpdateCoordinator):
                 f"(14-day average: {avg_price:.1f}p/kWh).",
             )
 
-        # 5. A meaningfully cheaper slot is coming within battery range — wait
-        wait_dt = cheapest_within_range["datetime"]
-        wait_price = cheapest_within_range["price"]
-        when = self._format_wait_time(wait_dt, now)
-        savings = round((current_price - wait_price) * kwh_needed / 100, 2) if kwh_needed > 0 else 0.0
-        savings_str = f", saves ~£{savings:.2f}" if savings > 0.01 else ""
+        # 5. Cheaper slot coming within driving range — wait for it
+        if cheapest_within_range is not None:
+            return _wait_msg(
+                cheapest_within_range,
+                f"Your battery will last {days_of_range:.1f} days.",
+            )
+
+        # 6. No cheaper option anywhere near — charge now
         return (
-            REC_WAIT,
-            f"Wait until {when} — {wait_price:.1f}p/kWh vs {current_price:.1f}p now"
-            f"{savings_str}. "
-            f"Your battery will last {days_of_range:.1f} days.",
+            REC_CHARGE_NOW_MINIMUM,
+            f"Charge now — no significantly cheaper period is coming within your battery range. "
+            f"Current price: {current_price:.1f}p/kWh (14-day average: {avg_price:.1f}p/kWh).",
         )
 
     # ------------------------------------------------------------------
