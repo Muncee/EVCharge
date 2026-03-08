@@ -7,24 +7,13 @@ CONF_REGION = "region"
 CONF_BATTERY_CAPACITY = "battery_capacity_kwh"
 CONF_DAILY_USAGE = "daily_usage_kwh"
 CONF_CHARGE_RATE = "charge_rate_kw"
-CONF_MIN_CHARGE_PCT = "min_charge_pct"
 CONF_TARGET_CHARGE_PCT = "target_charge_pct"
 CONF_BATTERY_ENTITY = "battery_entity"
-CONF_CHEAP_PERCENTILE = "cheap_percentile"
-CONF_EXPENSIVE_PERCENTILE = "expensive_percentile"
 
 # API
 API_BASE_URL = "https://agilepredict.com/api"
 API_DAYS = 14
-# AgilePredict updates 4x/day at 06:15, 10:15, 16:15, 22:15
 UPDATE_INTERVAL_MINUTES = 60
-
-# Recommendation states
-REC_CHARGE_NOW_FULLY = "charge_now_fully"
-REC_CHARGE_NOW_MINIMUM = "charge_now_minimum"
-REC_CHARGE_DAILY = "charge_daily"
-REC_WAIT = "wait"
-REC_UNKNOWN = "unknown"
 
 # Octopus Agile DNO regions
 OCTOPUS_REGIONS = {
@@ -44,45 +33,13 @@ OCTOPUS_REGIONS = {
     "P": "Northern Scotland",
 }
 
-# Data coordinator keys (what sensors read)
-DATA_RECOMMENDATION = "recommendation"
-DATA_REASON = "reason"
+# Coordinator data keys
 DATA_CURRENT_PRICE = "current_price"
-DATA_AVG_PRICE = "avg_price"
-DATA_CHEAP_THRESHOLD = "cheap_threshold"
-DATA_EXPENSIVE_THRESHOLD = "expensive_threshold"
-DATA_IS_CHEAP_NOW = "is_cheap_now"
-DATA_IS_EXPENSIVE_NOW = "is_expensive_now"
-DATA_NEXT_CHEAP_WINDOW = "next_cheap_window"
-DATA_NEXT_CHEAP_PRICE = "next_cheap_price"
-DATA_HOURS_UNTIL_CHEAP = "hours_until_cheap"
-DATA_CURRENT_BATTERY_PCT = "current_battery_pct"
-DATA_KWH_NEEDED = "kwh_needed"
-DATA_HOURS_TO_CHARGE = "hours_to_charge"
-DATA_COST_NOW = "cost_to_charge_now"
-DATA_COST_CHEAPEST = "cost_at_cheapest_today"
-DATA_ESTIMATED_SAVINGS = "estimated_savings"
-DATA_DAYS_OF_RANGE = "days_of_battery_range"
-DATA_PCT_EXPENSIVE_7DAYS = "pct_expensive_next_7days"
-DATA_CHEAPEST_TODAY_PRICE = "cheapest_today_price"
-DATA_CHEAPEST_TODAY_START = "cheapest_today_start"
-DATA_CHEAPEST_UPCOMING_PRICE = "cheapest_upcoming_price"
-DATA_CHEAPEST_UPCOMING_START = "cheapest_upcoming_start"
-DATA_PRICES = "prices"
-DATA_LONG_EXPENSIVE_DAYS = "long_expensive_days"
-DATA_CHARGE_NOW_BINARY = "charge_now"
+DATA_SCHEDULE = "schedule"          # list of session dicts
+DATA_SCHEDULE_ACTIVE = "schedule_active"  # bool — currently inside a charge window
+DATA_NEXT_START = "next_start"      # datetime of next window start
+DATA_NEXT_END = "next_end"          # datetime of next window end
+DATA_SUMMARY = "summary"            # short human-readable text
 
-# Multi-day charge planning
-DATA_NEXT_CHARGE_DATETIME = "next_charge_datetime"
-DATA_NEXT_CHARGE_PRICE = "next_charge_price"
-DATA_NEXT_CHARGE_TARGET_PCT = "next_charge_target_pct"
-DATA_SECOND_CHARGE_DATETIME = "second_charge_datetime"
-
-# Weekly charge schedule
-DATA_CHARGE_SCHEDULE = "charge_schedule"        # list of {start, end, price, target_pct}
-DATA_SCHEDULE_ACTIVE = "schedule_charge_active"  # bool — current slot is a scheduled charge window
-DATA_NEXT_SCHEDULE_START = "next_schedule_start" # datetime of next planned charge window
-DATA_NEXT_SCHEDULE_PRICE = "next_schedule_price" # price at that window
-
-# HA event fired when fresh next-day prices are detected (use in automations)
+# HA event fired daily after 16:30 local time when next-day prices arrive
 EVENT_PRICES_UPDATED = "ev_charge_optimizer_prices_updated"
