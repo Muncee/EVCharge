@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import math
+import statistics
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -24,12 +25,15 @@ from .const import (
     CONF_TARGET_CHARGE_PCT,
     CONF_BATTERY_ENTITY,
     DATA_CURRENT_PRICE,
+    DATA_AVG_14DAY,
     DATA_SCHEDULE_SLOTS,
     DATA_SCHEDULE_SESSIONS,
+    DATA_WEEKLY_PLAN,
     DATA_SCHEDULE_ACTIVE,
     DATA_NEXT_START,
     DATA_NEXT_END,
     DATA_SUMMARY,
+    DATA_NOTIFICATION_TEXT,
     EVENT_PRICES_UPDATED,
 )
 
@@ -37,9 +41,15 @@ _LOGGER = logging.getLogger(__name__)
 
 _SAFETY_PCT = 10.0
 
+# Day plan action codes
+ACTION_NO_CHARGE = "no_charge"
+ACTION_CHARGE = "charge"               # must-charge (battery running low)
+ACTION_OPPORTUNISTIC = "opportunistic"  # battery fine but tonight is cheap vs upcoming
+ACTION_FULL_CHARGE = "full_charge"     # exceptional price — charge to 100%
+
 
 class EVChargeCoordinator(DataUpdateCoordinator):
-    """Fetches AgilePredict prices and builds a weekly charge schedule."""
+    """Fetches AgilePredict prices and builds an intelligent weekly charge schedule."""
 
     def __init__(self, hass: HomeAssistant, config: dict[str, Any]) -> None:
         super().__init__(
@@ -78,7 +88,7 @@ class EVChargeCoordinator(DataUpdateCoordinator):
 
         result = self._compute(prices)
 
-        # Fire event once per day after 16:30 local — when next-day Agile prices land
+        # Fire notification event once per day after 16:30 local time
         local_now = dt_util.as_local(dt_util.utcnow())
         after_430 = local_now.hour > 16 or (local_now.hour == 16 and local_now.minute >= 30)
         if after_430 and self._last_notification_date != local_now.date():
@@ -87,7 +97,9 @@ class EVChargeCoordinator(DataUpdateCoordinator):
                 EVENT_PRICES_UPDATED,
                 {
                     "summary": result[DATA_SUMMARY],
+                    "notification_text": result[DATA_NOTIFICATION_TEXT],
                     "current_price": result[DATA_CURRENT_PRICE],
+                    "avg_14day_price": result[DATA_AVG_14DAY],
                 },
             )
 
@@ -146,7 +158,7 @@ class EVChargeCoordinator(DataUpdateCoordinator):
         return prices
 
     # ------------------------------------------------------------------
-    # Strategy
+    # Main computation
     # ------------------------------------------------------------------
 
     def _compute(self, prices: list[dict]) -> dict[str, Any]:
@@ -156,10 +168,9 @@ class EVChargeCoordinator(DataUpdateCoordinator):
         charge_rate: float = self.config[CONF_CHARGE_RATE]
         daily_usage: float = float(self.overrides.get(CONF_DAILY_USAGE, self.config[CONF_DAILY_USAGE]))
         target_pct: float = float(self.overrides.get(CONF_TARGET_CHARGE_PCT, self.config[CONF_TARGET_CHARGE_PCT]))
-
         current_battery_pct = self._get_battery_pct() or target_pct
 
-        # Current price
+        # Current slot price
         current_slot = next(
             (s for s in prices if s["datetime"] <= now < s["datetime"] + timedelta(minutes=30)),
             None,
@@ -170,42 +181,53 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             else (future_slots[0]["price"] if future_slots else None)
         )
 
-        # Build schedule
-        schedule_slots = self._build_schedule(
+        # 14-day average for all context calculations
+        all_14d_prices = [s["price"] for s in future_slots[: 14 * 48]]
+        avg_14day = statistics.mean(all_14d_prices) if all_14d_prices else 10.0
+
+        # Build the intelligent weekly plan
+        weekly_plan, schedule_slots = self._plan_weekly_schedule(
             prices=prices,
             current_battery_pct=current_battery_pct,
             target_pct=target_pct,
             daily_usage=daily_usage,
             battery_cap=battery_cap,
             charge_rate=charge_rate,
+            avg_14day=avg_14day,
             now=now,
         )
 
-        # Group into display sessions
+        # Group individual slots into consecutive sessions (for display / binary sensor attrs)
         sessions = _group_into_sessions(schedule_slots)
 
-        # Is a charge slot active right now?
+        # Active / next slot
         active_slot = next(
             (s for s in schedule_slots if s["datetime"] <= now < s["datetime"] + timedelta(minutes=30)),
             None,
         )
-
-        # Next upcoming slot
         next_slot = next((s for s in schedule_slots if s["datetime"] > now), None)
 
-        summary = self._make_summary(sessions, active_slot, now)
+        summary = self._make_summary(weekly_plan, active_slot, now)
+        notification_text = self._make_notification_text(weekly_plan, avg_14day, now)
 
         return {
             DATA_CURRENT_PRICE: round(current_price, 2) if current_price is not None else None,
+            DATA_AVG_14DAY: round(avg_14day, 2),
             DATA_SCHEDULE_SLOTS: schedule_slots,
             DATA_SCHEDULE_SESSIONS: sessions,
+            DATA_WEEKLY_PLAN: weekly_plan,
             DATA_SCHEDULE_ACTIVE: active_slot is not None,
             DATA_NEXT_START: next_slot["datetime"] if next_slot else None,
             DATA_NEXT_END: next_slot["datetime"] + timedelta(minutes=30) if next_slot else None,
             DATA_SUMMARY: summary,
+            DATA_NOTIFICATION_TEXT: notification_text,
         }
 
-    def _build_schedule(
+    # ------------------------------------------------------------------
+    # The weekly planner — the main brain
+    # ------------------------------------------------------------------
+
+    def _plan_weekly_schedule(
         self,
         prices: list[dict],
         current_battery_pct: float,
@@ -213,123 +235,285 @@ class EVChargeCoordinator(DataUpdateCoordinator):
         daily_usage: float,
         battery_cap: float,
         charge_rate: float,
+        avg_14day: float,
         now: datetime,
-    ) -> list[dict]:
-        """Build a 7-day list of individual 30-min charge slots.
+    ) -> tuple[list[dict], list[dict]]:
+        """Build a 7-day plan with intelligent reasoning.
 
-        For each charge cycle:
-          1. Calculate when the battery will hit the safety threshold
-          2. Calculate how many slots are needed to reach target%
-          3. Pick the N *cheapest individual slots* within the deadline window
-             (not necessarily consecutive — charger turns on/off per slot)
-          4. Repeat from target% after the last planned slot
+        For each day:
+          - Tracks battery state through the week
+          - Must-charge: battery will hit safety threshold
+          - Full-charge: today is exceptionally cheap AND upcoming days are expensive
+            e.g. battery at 81%, tonight is 2p, next 10 days average 12p → charge to 100%
+          - Opportunistic: today is meaningfully cheaper than upcoming days
+          - No charge: prices are average or above, battery is healthy
+
+        Returns (weekly_plan, flat_schedule_slots).
         """
-        if daily_usage <= 0 or charge_rate <= 0:
-            return []
+        local_now = dt_util.as_local(now)
+        future_slots = [s for s in prices if s["datetime"] > now]
 
-        safety_kwh = (_SAFETY_PCT / 100) * battery_cap
-        target_kwh = (target_pct / 100) * battery_cap
-        kwh_per_slot = charge_rate * 0.5  # energy added in one 30-min slot
+        if not future_slots or daily_usage <= 0 or charge_rate <= 0:
+            return [], []
 
-        all_slots: list[dict] = []
+        # Price percentiles for the full 14-day window
+        all_14d = sorted(s["price"] for s in future_slots[: 14 * 48])
+        p15 = _percentile(all_14d, 15)   # very cheap
+        p35 = _percentile(all_14d, 35)   # somewhat cheap
+
+        # Per-calendar-day price summary for next 7 days
+        day_summaries = []
+        for i in range(7):
+            day_date = local_now.date() + timedelta(days=i)
+            day_start_local = datetime(
+                day_date.year, day_date.month, day_date.day,
+                tzinfo=local_now.tzinfo,
+            )
+            day_start_utc = dt_util.as_utc(day_start_local)
+            day_end_utc = day_start_utc + timedelta(days=1)
+            # Today: only future slots; other days: all slots
+            if i == 0:
+                day_slots = [s for s in future_slots if s["datetime"] < day_end_utc]
+            else:
+                day_slots = [s for s in prices if day_start_utc <= s["datetime"] < day_end_utc]
+
+            if day_slots:
+                day_avg = statistics.mean(s["price"] for s in day_slots)
+                day_min = min(s["price"] for s in day_slots)
+            else:
+                day_avg = avg_14day
+                day_min = avg_14day
+
+            day_summaries.append({
+                "date": day_date,
+                "slots": day_slots,
+                "avg": day_avg,
+                "min": day_min,
+            })
+
+        # Battery simulation
+        safety_pct = _SAFETY_PCT
+        kwh_per_slot = charge_rate * 0.5
+        depletion_pct_per_day = (daily_usage / battery_cap) * 100
+
         battery = current_battery_pct
-        t = now
-        horizon = now + timedelta(days=7)
-        future_prices = [s for s in prices if s["datetime"] >= now]
-        scheduled_dts: set[datetime] = set()  # avoid double-booking a slot
+        scheduled_dts: set[datetime] = set()
+        weekly_plan: list[dict] = []
+        all_charge_slots: list[dict] = []
 
-        for _ in range(20):
-            current_kwh = (battery / 100) * battery_cap
-            usable_kwh = max(0.0, current_kwh - safety_kwh)
-            hours_of_range = (usable_kwh / daily_usage) * 24
-            must_charge_by = t + timedelta(hours=hours_of_range)
+        for i, day in enumerate(day_summaries):
+            battery_at_start = battery
 
-            if must_charge_by > horizon:
-                break  # battery lasts the full week
+            # Will battery hit safety within the next ~2 days without charging?
+            battery_in_2_days = battery_at_start - 2 * depletion_pct_per_day
+            must_charge = battery_in_2_days <= safety_pct
 
-            # How many slots to go from safety% to target%?
-            kwh_needed = max(0.0, target_kwh - safety_kwh)
-            n_slots = max(1, math.ceil(kwh_needed / kwh_per_slot))
+            # What do the upcoming days look like price-wise?
+            lookahead = day_summaries[i + 1 : i + 6]  # next 5 days
+            next_days_avg = (
+                statistics.mean(d["avg"] for d in lookahead) if lookahead else avg_14day
+            )
+            # How much more expensive are upcoming days vs today?
+            price_ratio = next_days_avg / day["avg"] if day["avg"] > 0 else 1.0
 
-            # Candidate slots: after t, before deadline, not already scheduled
-            candidates = [
-                s for s in future_prices
-                if s["datetime"] > t
-                and s["datetime"] < must_charge_by
-                and s["datetime"] not in scheduled_dts
-            ]
+            today_is_very_cheap = day["avg"] <= p15
+            today_is_cheap = day["avg"] <= p35
+            upcoming_expensive = next_days_avg > avg_14day * 1.08  # upcoming is above avg
 
-            if len(candidates) < n_slots:
-                # Deadline is tight — take what we can find
-                candidates = [
-                    s for s in future_prices
-                    if s["datetime"] > t and s["datetime"] not in scheduled_dts
-                ][:n_slots * 3]
+            # --- Decision ---
+            if must_charge:
+                # Battery genuinely running low — must charge
+                # If it's also cheap, charge to full
+                if today_is_cheap and upcoming_expensive and price_ratio >= 1.3:
+                    action = ACTION_FULL_CHARGE
+                    charge_to = 100.0
+                    reason = (
+                        f"Battery needs charging (will reach {safety_pct:.0f}% soon) "
+                        f"AND today is {((1 - day['avg'] / avg_14day) * 100):.0f}% cheaper "
+                        f"than the 14-day average. "
+                        f"Next {len(lookahead)} days average {next_days_avg:.1f}p — "
+                        f"topping up fully while it's cheap."
+                    )
+                else:
+                    action = ACTION_CHARGE
+                    charge_to = target_pct
+                    reason = (
+                        f"Battery will reach the {safety_pct:.0f}% safety threshold "
+                        f"within the next 2 days — charging to {target_pct:.0f}%."
+                    )
 
-            if not candidates:
-                break
+            elif today_is_very_cheap and upcoming_expensive and price_ratio >= 1.5 and battery_at_start < 98:
+                # Exceptional price today, expensive week ahead — fully charge
+                action = ACTION_FULL_CHARGE
+                charge_to = 100.0
+                reason = (
+                    f"Today's prices ({day['avg']:.1f}p avg) are exceptionally cheap — "
+                    f"in the bottom 15% of the next 2 weeks "
+                    f"({((1 - day['avg'] / avg_14day) * 100):.0f}% below the {avg_14day:.1f}p average). "
+                    f"Next {len(lookahead)} days average {next_days_avg:.1f}p "
+                    f"({price_ratio:.1f}x more expensive) — recommended to fully charge now."
+                )
 
-            # Pick the cheapest N individual slots
-            chosen = sorted(candidates, key=lambda s: s["price"])[:n_slots]
-            chosen.sort(key=lambda s: s["datetime"])
+            elif today_is_cheap and upcoming_expensive and price_ratio >= 1.25 and battery_at_start < (target_pct - 5):
+                # Meaningfully cheaper today, battery below target — top up
+                action = ACTION_OPPORTUNISTIC
+                charge_to = target_pct
+                reason = (
+                    f"Good opportunity — today's prices ({day['avg']:.1f}p avg) are "
+                    f"{((1 - day['avg'] / avg_14day) * 100):.0f}% below average "
+                    f"and the next {len(lookahead)} days average {next_days_avg:.1f}p "
+                    f"({price_ratio:.1f}x more expensive). "
+                    f"Charging to {target_pct:.0f}% while it's relatively cheap."
+                )
 
-            for slot in chosen:
-                scheduled_dts.add(slot["datetime"])
-                all_slots.append(slot)
+            else:
+                action = ACTION_NO_CHARGE
+                charge_to = None
+                if day["avg"] > avg_14day * 1.10:
+                    reason = (
+                        f"Prices are {((day['avg'] / avg_14day - 1) * 100):.0f}% above "
+                        f"the 14-day average ({day['avg']:.1f}p vs {avg_14day:.1f}p) — "
+                        f"not charging today. Battery at {battery_at_start:.0f}%."
+                    )
+                else:
+                    reason = (
+                        f"Battery healthy at {battery_at_start:.0f}% and prices are average "
+                        f"({day['avg']:.1f}p) — no charge needed today."
+                    )
 
-            # Next cycle starts after the last chosen slot
-            last_slot = chosen[-1]
-            t = last_slot["datetime"] + timedelta(minutes=30)
-            battery = target_pct
+            # --- Pick cheapest individual slots for this day's charge ---
+            charge_slots: list[dict] = []
+            if action != ACTION_NO_CHARGE:
+                current_kwh = (battery_at_start / 100) * battery_cap
+                target_kwh = (charge_to / 100) * battery_cap
+                charge_kwh = max(0.0, target_kwh - current_kwh)
+                n_slots = max(1, math.ceil(charge_kwh / kwh_per_slot))
 
-            if t >= horizon:
-                break
+                # Candidates: this day's slots (plus early next morning if needed)
+                available = [s for s in day["slots"] if s["datetime"] not in scheduled_dts]
+                if len(available) < n_slots and i + 1 < len(day_summaries):
+                    next_morning = [
+                        s for s in day_summaries[i + 1]["slots"]
+                        if s["datetime"] not in scheduled_dts
+                        and dt_util.as_local(s["datetime"]).hour < 9
+                    ]
+                    available = available + next_morning
 
-        all_slots.sort(key=lambda s: s["datetime"])
-        return all_slots
+                chosen = sorted(available, key=lambda s: s["price"])[:n_slots]
+                chosen.sort(key=lambda s: s["datetime"])
+
+                for s in chosen:
+                    scheduled_dts.add(s["datetime"])
+                charge_slots = chosen
+                all_charge_slots.extend(chosen)
+
+                battery = min(100.0, charge_to)
+            else:
+                battery = max(0.0, battery_at_start - depletion_pct_per_day)
+
+            # Slot times for display
+            slot_times = _format_slot_times(charge_slots, local_now)
+            vs_avg = ((day["avg"] - avg_14day) / avg_14day * 100) if avg_14day > 0 else 0
+            all_predicted = all(s.get("predicted", True) for s in day["slots"][:3]) if day["slots"] else True
+
+            weekly_plan.append({
+                "date": day["date"].isoformat(),
+                "day_name": day["date"].strftime("%A"),
+                "short_date": day["date"].strftime("%-d %b"),
+                "action": action,
+                "reason": reason,
+                "charge_slots": [
+                    {
+                        "datetime": s["datetime"].isoformat(),
+                        "time": dt_util.as_local(s["datetime"]).strftime("%H:%M"),
+                        "price_p_kwh": round(s["price"], 2),
+                        "predicted": s.get("predicted", True),
+                    }
+                    for s in charge_slots
+                ],
+                "charge_slot_times": slot_times,
+                "target_pct": charge_to,
+                "battery_start_pct": round(battery_at_start, 1),
+                "day_avg_price": round(day["avg"], 2),
+                "day_min_price": round(day["min"], 2),
+                "vs_14day_avg_pct": round(vs_avg, 1),
+                "prices_predicted": all_predicted,
+                "n_slots": len(charge_slots),
+                "charge_hours": round(len(charge_slots) * 0.5, 1),
+            })
+
+        all_charge_slots.sort(key=lambda s: s["datetime"])
+        return weekly_plan, all_charge_slots
 
     # ------------------------------------------------------------------
-    # Summary
+    # Text generation
     # ------------------------------------------------------------------
 
     def _make_summary(
         self,
-        sessions: list[dict],
+        weekly_plan: list[dict],
         active_slot: dict | None,
         now: datetime,
     ) -> str:
         if active_slot:
-            # Find which session is active
-            active_sess = next(
-                (s for s in sessions if s["start"] <= now < s["end"]),
-                None,
-            )
-            if active_sess:
-                end_local = dt_util.as_local(active_sess["end"])
+            return f"Charging now ({active_slot['price']:.1f}p/kWh)"
+        if not weekly_plan:
+            return "No schedule — check settings"
+        # Find today
+        local_now = dt_util.as_local(now)
+        today = local_now.date()
+        for day in weekly_plan:
+            import datetime as _dt
+            day_date = _dt.date.fromisoformat(day["date"])
+            if day_date == today and day["action"] != ACTION_NO_CHARGE:
+                return f"Today: {_action_label(day['action'])} — {day['charge_slot_times']}"
+        # No charge today — show next charge
+        for day in weekly_plan:
+            if day["action"] != ACTION_NO_CHARGE and day["charge_slots"]:
                 return (
-                    f"Charging now until {end_local.strftime('%H:%M')} "
-                    f"({active_sess['avg_price']:.1f}p avg)"
+                    f"Next: {day['day_name']} {day['charge_slot_times']} "
+                    f"({day['day_avg_price']:.1f}p avg)"
                 )
-            return "Charging now"
+        return "Battery healthy — no charging needed this week"
 
-        if not sessions:
-            return "No charge sessions planned — check daily usage setting"
+    def _make_notification_text(
+        self, weekly_plan: list[dict], avg_14day: float, now: datetime
+    ) -> str:
+        """Multi-line text for push notifications and Markdown cards."""
+        local_now = dt_util.as_local(now)
+        lines = [f"📅 EV Charge Schedule — updated {local_now.strftime('%-d %b %H:%M')}", ""]
+        for day in weekly_plan:
+            action = day["action"]
+            label = _action_label(action)
+            if action == ACTION_NO_CHARGE:
+                icon = "🟢"
+                detail = f"{day['day_avg_price']:.1f}p avg"
+                if day["vs_14day_avg_pct"] > 10:
+                    detail += f" (+{day['vs_14day_avg_pct']:.0f}% vs avg)"
+            elif action == ACTION_FULL_CHARGE:
+                icon = "⚡"
+                detail = (
+                    f"{day['charge_slot_times']} · "
+                    f"{day['day_min_price']:.1f}p cheapest · "
+                    f"{day['charge_hours']:.1f}h"
+                )
+            else:
+                icon = "🔵"
+                detail = (
+                    f"{day['charge_slot_times']} · "
+                    f"{day['day_avg_price']:.1f}p avg · "
+                    f"{day['charge_hours']:.1f}h"
+                )
 
-        upcoming = next((s for s in sessions if s["start"] > now), None)
-        if not upcoming:
-            return "All sessions complete for this week"
+            predicted_note = " (predicted)" if day["prices_predicted"] else ""
+            lines.append(
+                f"{icon} {day['day_name']} {day['short_date']}: {label}{predicted_note}"
+            )
+            lines.append(f"   {detail}")
 
-        start_local = dt_util.as_local(upcoming["start"])
-        end_local = dt_util.as_local(upcoming["end"])
-        diff = (start_local.date() - dt_util.as_local(now).date()).days
-        day = "Today" if diff == 0 else "Tomorrow" if diff == 1 else start_local.strftime("%A")
-
-        n_slots = upcoming["n_slots"]
-        hours = n_slots * 0.5
-        return (
-            f"Next: {day} {start_local.strftime('%H:%M')}–{end_local.strftime('%H:%M')} "
-            f"({n_slots} slots, {hours:.1f}h, {upcoming['avg_price']:.1f}p avg)"
-        )
+        lines.append("")
+        lines.append(f"14-day average: {avg_14day:.1f}p/kWh")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Battery helper
@@ -349,24 +533,17 @@ class EVChargeCoordinator(DataUpdateCoordinator):
 
 
 # ------------------------------------------------------------------
-# Grouping helper (module-level — used by both coordinator and sensors)
+# Module-level helpers
 # ------------------------------------------------------------------
 
 def _group_into_sessions(slots: list[dict]) -> list[dict]:
-    """Group consecutive 30-min slots into display sessions.
-
-    Two slots belong to the same session if they are exactly 30 min apart.
-    Non-consecutive cheap slots appear as separate session entries.
-    """
+    """Group consecutive 30-min slots into display sessions."""
     if not slots:
         return []
-
     sessions = []
     run = [slots[0]]
-
     for slot in slots[1:]:
-        gap = slot["datetime"] - run[-1]["datetime"]
-        if gap == timedelta(minutes=30):
+        if slot["datetime"] - run[-1]["datetime"] == timedelta(minutes=30):
             run.append(slot)
         else:
             sessions.append(_session_from_run(run))
@@ -386,3 +563,39 @@ def _session_from_run(run: list[dict]) -> dict:
         "predicted": all(s.get("predicted", True) for s in run),
         "slots": [{"datetime": s["datetime"], "price": round(s["price"], 2)} for s in run],
     }
+
+
+def _format_slot_times(slots: list[dict], local_now: datetime) -> str:
+    """Return a compact human-readable list of slot times, grouping consecutive runs."""
+    if not slots:
+        return "—"
+    sessions = _group_into_sessions(slots)
+    parts = []
+    for s in sessions:
+        start = dt_util.as_local(s["start"]).strftime("%H:%M")
+        end = dt_util.as_local(s["end"]).strftime("%H:%M")
+        if s["n_slots"] == 1:
+            parts.append(start)
+        else:
+            parts.append(f"{start}–{end}")
+    return ", ".join(parts)
+
+
+def _action_label(action: str) -> str:
+    return {
+        ACTION_NO_CHARGE: "No charge",
+        ACTION_CHARGE: "Charge overnight",
+        ACTION_OPPORTUNISTIC: "Charge (good price)",
+        ACTION_FULL_CHARGE: "FULL CHARGE — exceptional value",
+    }.get(action, action)
+
+
+def _percentile(sorted_data: list[float], pct: float) -> float:
+    if not sorted_data:
+        return 0.0
+    k = (len(sorted_data) - 1) * pct / 100
+    f = int(k)
+    c = f + 1
+    if c >= len(sorted_data):
+        return sorted_data[-1]
+    return sorted_data[f] + (k - f) * (sorted_data[c] - sorted_data[f])

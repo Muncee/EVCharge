@@ -34,13 +34,16 @@ OCTOPUS_REGIONS = {
 }
 
 # Coordinator data keys
-DATA_CURRENT_PRICE = "current_price"
-DATA_SCHEDULE_SLOTS = "schedule_slots"    # list of {datetime, price, predicted} — individual ON slots
-DATA_SCHEDULE_SESSIONS = "schedule_sessions"  # grouped for display
-DATA_SCHEDULE_ACTIVE = "schedule_active"  # bool — current slot is a scheduled charge slot
-DATA_NEXT_START = "next_start"            # datetime: start of next charge slot
-DATA_NEXT_END = "next_end"               # datetime: end of next charge slot
-DATA_SUMMARY = "summary"                 # short human-readable text
+DATA_CURRENT_PRICE = "current_price"         # float p/kWh
+DATA_AVG_14DAY = "avg_14day_price"           # float — 14-day average for context
+DATA_SCHEDULE_SLOTS = "schedule_slots"       # list of {datetime, price, predicted} — individual ON slots
+DATA_SCHEDULE_SESSIONS = "schedule_sessions" # consecutive slot groups (for binary sensor attrs)
+DATA_WEEKLY_PLAN = "weekly_plan"             # list of 7 day-plan dicts (the main schedule)
+DATA_SCHEDULE_ACTIVE = "schedule_active"     # bool — current slot is a scheduled charge slot
+DATA_NEXT_START = "next_start"               # datetime: start of next charge slot
+DATA_NEXT_END = "next_end"                   # datetime: end of next charge slot
+DATA_SUMMARY = "summary"                     # one-line summary string
+DATA_NOTIFICATION_TEXT = "notification_text" # multi-line schedule for notifications
 
 # HA event fired daily after 16:30 local time when next-day prices arrive
 EVENT_PRICES_UPDATED = "ev_charge_optimizer_prices_updated"
