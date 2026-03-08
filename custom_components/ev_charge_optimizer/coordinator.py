@@ -76,7 +76,7 @@ class EVChargeCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self) -> dict[str, Any]:
         region = self.config[CONF_REGION]
-        url = f"{API_BASE_URL}/{region}?days={API_DAYS}&high_low=True"
+        url = f"{API_BASE_URL}/{region}?days={API_DAYS}&forecast_count=1&high_low=True"
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -91,8 +91,15 @@ class EVChargeCoordinator(DataUpdateCoordinator):
         except aiohttp.ClientError as err:
             raise UpdateFailed(f"Network error fetching AgilePredict data: {err}") from err
 
+        _LOGGER.debug("AgilePredict raw response (first 500 chars): %s", str(raw)[:500])
         prices = self._parse_prices(raw)
         if not prices:
+            _LOGGER.error(
+                "AgilePredict returned no usable price data. "
+                "Raw response type=%s, value (first 300 chars)=%s",
+                type(raw).__name__,
+                str(raw)[:300],
+            )
             raise UpdateFailed("AgilePredict returned no usable price data")
 
         current_battery_pct = self._get_battery_pct()
@@ -108,16 +115,21 @@ class EVChargeCoordinator(DataUpdateCoordinator):
         try:
             # API returns an array of forecasts; take the most recent
             forecast = raw[0] if isinstance(raw, list) and raw else raw
-            raw_prices = forecast.get("prices", [])
+            if not isinstance(forecast, dict):
+                _LOGGER.error("Unexpected AgilePredict forecast type: %s", type(forecast).__name__)
+                return prices
+            raw_prices = forecast.get("prices") or forecast.get("data") or []
+            _LOGGER.debug("raw_prices type=%s len=%s", type(raw_prices).__name__, len(raw_prices) if hasattr(raw_prices, "__len__") else "?")
 
             if isinstance(raw_prices, dict):
                 # Dict keyed by datetime string
                 for dt_str, vals in raw_prices.items():
                     dt = dt_util.parse_datetime(dt_str)
                     if not dt:
+                        _LOGGER.debug("Could not parse datetime: %s", dt_str)
                         continue
                     if isinstance(vals, dict):
-                        price = float(vals.get("forecast", vals.get("price", 0)))
+                        price = float(vals.get("forecast") or vals.get("price") or vals.get("value") or 0)
                         high = float(vals.get("high", price))
                         low = float(vals.get("low", price))
                     else:
@@ -134,11 +146,13 @@ class EVChargeCoordinator(DataUpdateCoordinator):
                         item.get("datetime")
                         or item.get("valid_from")
                         or item.get("time")
+                        or item.get("period")
                     )
                     price = float(
                         item.get("forecast")
                         or item.get("price")
                         or item.get("value_inc_vat")
+                        or item.get("value")
                         or 0
                     )
                     high = float(item.get("high", price))
