@@ -57,6 +57,11 @@ from .const import (
     DATA_NEXT_CHARGE_PRICE,
     DATA_NEXT_CHARGE_TARGET_PCT,
     DATA_SECOND_CHARGE_DATETIME,
+    DATA_CHARGE_SCHEDULE,
+    DATA_SCHEDULE_ACTIVE,
+    DATA_NEXT_SCHEDULE_START,
+    DATA_NEXT_SCHEDULE_PRICE,
+    EVENT_PRICES_UPDATED,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -73,8 +78,10 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             update_interval=timedelta(minutes=UPDATE_INTERVAL_MINUTES),
         )
         self.config = config
-        # Runtime overrides set by number entities (min%, target%, daily usage)
+        # Runtime overrides set by number entities (target%, daily usage)
         self.overrides: dict[str, Any] = {}
+        # Track last notification date so we fire once per day after 4:30pm
+        self._last_notification_date: Any = None
 
     async def _async_update_data(self) -> dict[str, Any]:
         region = self.config[CONF_REGION]
@@ -105,7 +112,36 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             raise UpdateFailed("AgilePredict returned no usable price data")
 
         current_battery_pct = self._get_battery_pct()
-        return self._compute_strategy(prices, current_battery_pct)
+        result = self._compute_strategy(prices, current_battery_pct)
+
+        # Fire a HA event once per day at the first update after 16:30 local time.
+        # This aligns with Octopus publishing next-day Agile prices (~4pm).
+        local_now = dt_util.as_local(dt_util.utcnow())
+        if (
+            local_now.hour > 16 or (local_now.hour == 16 and local_now.minute >= 30)
+        ) and self._last_notification_date != local_now.date():
+            self._last_notification_date = local_now.date()
+            self.hass.bus.async_fire(
+                EVENT_PRICES_UPDATED,
+                {
+                    "recommendation": result[DATA_RECOMMENDATION],
+                    "reason": result[DATA_REASON],
+                    "current_price": result[DATA_CURRENT_PRICE],
+                    "next_schedule_start": (
+                        result[DATA_NEXT_SCHEDULE_START].isoformat()
+                        if result[DATA_NEXT_SCHEDULE_START]
+                        else None
+                    ),
+                    "next_schedule_price": result[DATA_NEXT_SCHEDULE_PRICE],
+                },
+            )
+            _LOGGER.info(
+                "ev_charge_optimizer: fired %s — %s",
+                EVENT_PRICES_UPDATED,
+                result[DATA_REASON],
+            )
+
+        return result
 
     # ------------------------------------------------------------------
     # Parsing
@@ -194,6 +230,10 @@ class EVChargeCoordinator(DataUpdateCoordinator):
 
     # Hard-coded safety buffer — battery below this = must charge now
     _SAFETY_PCT = 10.0
+    # Truly empty — charge regardless of price
+    _CRITICAL_PCT = 5.0
+    # Only recommend waiting if the upcoming slot is at least this much cheaper
+    _WAIT_SAVING_THRESHOLD = 0.80  # 20% cheaper
 
     def _compute_strategy(
         self, prices: list[dict], current_battery_pct: float | None
@@ -278,6 +318,12 @@ class EVChargeCoordinator(DataUpdateCoordinator):
         )
 
         # ---------------------------------------------------------------
+        # Cheapest slot in the next 24 hours (parked-car lookahead)
+        # ---------------------------------------------------------------
+        slots_24h = [s for s in future_slots if s["datetime"] < now + timedelta(hours=24)]
+        cheapest_24h = min(slots_24h, key=lambda x: x["price"]) if slots_24h else None
+
+        # ---------------------------------------------------------------
         # Upcoming expensive period analysis (vs median, not a fixed threshold)
         # ---------------------------------------------------------------
         median_price = self._percentile(sorted_analysis, 50)
@@ -317,6 +363,7 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             target_pct=target_pct,
             days_of_range=days_of_range,
             cheapest_within_range=cheapest_within_range,
+            cheapest_24h=cheapest_24h,
             pct_above_median_7day=pct_above_median_7day,
             avg_price=avg_price,
             now=now,
@@ -324,7 +371,7 @@ class EVChargeCoordinator(DataUpdateCoordinator):
 
         charge_now_binary = recommendation in (REC_CHARGE_NOW_FULLY, REC_CHARGE_NOW_MINIMUM)
 
-        # Multi-day charge plan
+        # Multi-day charge plan (legacy 2-session)
         next_charge_dt, next_charge_price, next_charge_target, second_charge_dt = (
             self._plan_charge_sessions(
                 prices=prices,
@@ -336,6 +383,21 @@ class EVChargeCoordinator(DataUpdateCoordinator):
                 now=now,
             )
         )
+
+        # Full weekly schedule
+        charge_schedule = self._build_charge_schedule(
+            prices=prices,
+            current_battery_pct=current_battery_pct,
+            target_pct=target_pct,
+            daily_usage=daily_usage,
+            battery_cap=battery_cap,
+            charge_rate=charge_rate,
+            now=now,
+        )
+        # First future window from schedule
+        future_windows = [w for w in charge_schedule if w["end"] > now]
+        active_window = next((w for w in future_windows if w["start"] <= now < w["end"]), None)
+        next_window = next((w for w in future_windows if w["start"] > now), None)
 
         return {
             DATA_RECOMMENDATION: recommendation,
@@ -368,6 +430,10 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             DATA_NEXT_CHARGE_PRICE: next_charge_price,
             DATA_NEXT_CHARGE_TARGET_PCT: next_charge_target,
             DATA_SECOND_CHARGE_DATETIME: second_charge_dt,
+            DATA_CHARGE_SCHEDULE: charge_schedule,
+            DATA_SCHEDULE_ACTIVE: active_window is not None,
+            DATA_NEXT_SCHEDULE_START: next_window["start"] if next_window else None,
+            DATA_NEXT_SCHEDULE_PRICE: round(next_window["price"], 2) if next_window else None,
         }
 
     def _decide_strategy(
@@ -380,6 +446,7 @@ class EVChargeCoordinator(DataUpdateCoordinator):
         target_pct: float,
         days_of_range: float,
         cheapest_within_range: dict | None,
+        cheapest_24h: dict | None,
         pct_above_median_7day: float,
         avg_price: float,
         now: datetime,
@@ -387,19 +454,47 @@ class EVChargeCoordinator(DataUpdateCoordinator):
         """
         Decide whether to charge now, wait, or do nothing.
 
+        Key design principle: the car is parked most of the time. The battery
+        depletion rate (daily_usage) does NOT apply while parked, so we should
+        not use it to gate whether waiting is possible. Instead we always check
+        the next 24 hours for a cheaper slot first.
+
         current_rank: 0.0 = cheapest slot in next 14 days, 1.0 = most expensive.
         """
-        # 1. Battery critically low — charge regardless of price
-        if current_battery_pct <= self._SAFETY_PCT + 5:
+        def _wait_msg(slot: dict, note: str) -> tuple[str, str]:
+            wait_price = slot["price"]
+            when = self._format_wait_time(slot["datetime"], now)
+            savings = round((current_price - wait_price) * kwh_needed / 100, 2) if kwh_needed > 0 else 0.0
+            savings_str = f", saves ~£{savings:.2f}" if savings > 0.01 else ""
+            return (
+                REC_WAIT,
+                f"Wait until {when} — {wait_price:.1f}p/kWh vs {current_price:.1f}p now"
+                f"{savings_str}. {note}",
+            )
+
+        # 1. Truly empty — must charge immediately regardless of price
+        if current_battery_pct <= self._CRITICAL_PCT:
             return (
                 REC_CHARGE_NOW_MINIMUM,
                 f"Battery is critically low at {current_battery_pct:.0f}% — "
-                f"charge now ({current_price:.1f}p/kWh) to avoid running out.",
+                f"charge now ({current_price:.1f}p/kWh) before it runs out completely.",
             )
 
-        # 2. Opportunistic top-up: price is in the bottom 15% of next 14 days
-        #    AND an expensive period dominates the next 7 days.
-        #    Recommend charging even if battery isn't low.
+        # 2. Cheap slot coming within 24 hours that's at least 20% cheaper than now.
+        #    The car is likely parked — always worth waiting even with a low battery.
+        if (
+            cheapest_24h is not None
+            and cheapest_24h["price"] < current_price * self._WAIT_SAVING_THRESHOLD
+        ):
+            low_note = (
+                f"Battery is low ({current_battery_pct:.0f}%) — don't drive far before then."
+                if current_battery_pct < 25
+                else f"Your battery will last {days_of_range:.1f} days."
+            )
+            return _wait_msg(cheapest_24h, low_note)
+
+        # 3. Opportunistic top-up: prices are in the bottom 15% of the next 2 weeks
+        #    AND an expensive period dominates the coming week.
         if current_rank <= 0.15 and kwh_needed > 0 and pct_above_median_7day >= 0.60:
             savings = round((avg_price - current_price) * kwh_needed / 100, 2)
             rank_pct = max(1, int(current_rank * 100))
@@ -411,18 +506,12 @@ class EVChargeCoordinator(DataUpdateCoordinator):
                 f"Charging to {target_pct:.0f}% now saves ~£{savings:.2f} vs waiting.",
             )
 
-        # 3. Battery won't reach any cheaper slot — charge now at current price
-        if cheapest_within_range is None:
-            return (
-                REC_CHARGE_NOW_MINIMUM,
-                f"Charge now — battery won't last until the next cheap period "
-                f"(only {days_of_range:.1f} days of range left). "
-                f"Current price: {current_price:.1f}p/kWh.",
-            )
-
-        # 4. Current price is the cheapest (or within 10%) of anything reachable
-        if current_price <= cheapest_within_range["price"] * 1.10 and kwh_needed > 0:
-            savings = round((avg_price - current_price) * kwh_needed / 100, 2)
+        # 4. Now is the cheapest (or near-cheapest) slot within battery driving range
+        if (
+            cheapest_within_range is not None
+            and current_price <= cheapest_within_range["price"] * 1.10
+            and kwh_needed > 0
+        ):
             return (
                 REC_CHARGE_NOW_FULLY,
                 f"Good time to charge — {current_price:.1f}p/kWh is the cheapest available "
@@ -430,17 +519,18 @@ class EVChargeCoordinator(DataUpdateCoordinator):
                 f"(14-day average: {avg_price:.1f}p/kWh).",
             )
 
-        # 5. A meaningfully cheaper slot is coming within battery range — wait
-        wait_dt = cheapest_within_range["datetime"]
-        wait_price = cheapest_within_range["price"]
-        when = self._format_wait_time(wait_dt, now)
-        savings = round((current_price - wait_price) * kwh_needed / 100, 2) if kwh_needed > 0 else 0.0
-        savings_str = f", saves ~£{savings:.2f}" if savings > 0.01 else ""
+        # 5. Cheaper slot coming within driving range — wait for it
+        if cheapest_within_range is not None:
+            return _wait_msg(
+                cheapest_within_range,
+                f"Your battery will last {days_of_range:.1f} days.",
+            )
+
+        # 6. No cheaper option anywhere near — charge now
         return (
-            REC_WAIT,
-            f"Wait until {when} — {wait_price:.1f}p/kWh vs {current_price:.1f}p now"
-            f"{savings_str}. "
-            f"Your battery will last {days_of_range:.1f} days.",
+            REC_CHARGE_NOW_MINIMUM,
+            f"Charge now — no significantly cheaper period is coming within your battery range. "
+            f"Current price: {current_price:.1f}p/kWh (14-day average: {avg_price:.1f}p/kWh).",
         )
 
     # ------------------------------------------------------------------
@@ -502,6 +592,72 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             target_pct,
             second_optimal["datetime"] if second_optimal else None,
         )
+
+    def _build_charge_schedule(
+        self,
+        prices: list[dict],
+        current_battery_pct: float,
+        target_pct: float,
+        daily_usage: float,
+        battery_cap: float,
+        charge_rate: float,
+        now: datetime,
+    ) -> list[dict]:
+        """Build a 7-day charge schedule.
+
+        Returns a list of dicts: {start, end, price, target_pct}.
+        Each entry is a planned charge window. The car is assumed to deplete
+        at daily_usage kWh/day between sessions.
+        """
+        if daily_usage <= 0:
+            return []
+
+        schedule: list[dict] = []
+        battery = current_battery_pct
+        t = now
+        safety_kwh = (self._SAFETY_PCT / 100) * battery_cap
+        target_kwh = (target_pct / 100) * battery_cap
+        horizon = now + timedelta(days=7)
+        future_slots = [s for s in prices if s["datetime"] > now]
+
+        for _ in range(20):  # safety cap on iterations
+            kwh = (battery / 100) * battery_cap
+            usable = max(0.0, kwh - safety_kwh)
+            hours_until_empty = (usable / daily_usage) * 24
+            must_charge_by = t + timedelta(hours=hours_until_empty)
+
+            if must_charge_by > horizon:
+                break  # battery lasts beyond the 7-day window — done
+
+            kwh_needed = max(0.0, target_kwh - max(kwh, safety_kwh))
+            hours_to_charge = max(0.5, kwh_needed / charge_rate) if charge_rate > 0 else 1.0
+            latest_start = must_charge_by - timedelta(hours=hours_to_charge)
+
+            candidates = [s for s in future_slots if t < s["datetime"] <= latest_start]
+            if not candidates:
+                # No room before deadline — take the soonest available slot
+                candidates = [s for s in future_slots if s["datetime"] > t][:8]
+            if not candidates:
+                break
+
+            best = min(candidates, key=lambda x: x["price"])
+            start_dt = best["datetime"]
+            end_dt = start_dt + timedelta(hours=hours_to_charge)
+
+            schedule.append({
+                "start": start_dt,
+                "end": end_dt,
+                "price": best["price"],
+                "target_pct": target_pct,
+            })
+
+            battery = target_pct
+            t = end_dt
+
+            if t >= horizon:
+                break
+
+        return schedule
 
     def _format_wait_time(self, dt: datetime, now: datetime) -> str:
         """Format a future datetime as e.g. 'today at 06:30', 'tomorrow at 14:00', 'Friday at 02:00'."""
@@ -569,4 +725,8 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             DATA_NEXT_CHARGE_PRICE: None,
             DATA_NEXT_CHARGE_TARGET_PCT: None,
             DATA_SECOND_CHARGE_DATETIME: None,
+            DATA_CHARGE_SCHEDULE: [],
+            DATA_SCHEDULE_ACTIVE: False,
+            DATA_NEXT_SCHEDULE_START: None,
+            DATA_NEXT_SCHEDULE_PRICE: None,
         }
