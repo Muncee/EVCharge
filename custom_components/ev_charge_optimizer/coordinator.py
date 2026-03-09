@@ -48,6 +48,7 @@ ACTION_NO_CHARGE = "no_charge"
 ACTION_CHARGE = "charge"               # must-charge (battery running low)
 ACTION_OPPORTUNISTIC = "opportunistic"  # battery fine but tonight is cheap vs upcoming
 ACTION_FULL_CHARGE = "full_charge"     # exceptional price — charge to 100%
+ACTION_ROUTINE = "routine"             # battery below target, cheapest night in 2-3 day window
 
 
 class EVChargeCoordinator(DataUpdateCoordinator):
@@ -260,6 +261,16 @@ class EVChargeCoordinator(DataUpdateCoordinator):
         local_now = dt_util.as_local(now)
         future_slots = [s for s in prices if s["datetime"] > now]
 
+        # Floor now to the nearest 30-min slot boundary.
+        # Prevents the coordinator dropping a slot that started in the same
+        # 30-min window it happens to refresh in (e.g. refreshes at 22:30:01
+        # → slot at 22:30:00 excluded because now > slot_start by 1 second).
+        now_floor = now - timedelta(
+            minutes=now.minute % 30,
+            seconds=now.second,
+            microseconds=now.microsecond,
+        )
+
         if not future_slots or daily_usage <= 0 or charge_rate <= 0:
             return [], []
 
@@ -299,8 +310,10 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             overnight_start_utc = dt_util.as_utc(overnight_start_local)
             overnight_end_utc = dt_util.as_utc(overnight_end_local)
 
-            # For today: start from max(now, 18:00) so we never look backwards
-            effective_overnight_start = max(now, overnight_start_utc) if i == 0 else overnight_start_utc
+            # For today: start from max(now_floor, 18:00).
+            # Using the floored time means a slot at 22:30:00 is never
+            # accidentally dropped when the coordinator refreshes at 22:30:01.
+            effective_overnight_start = max(now_floor, overnight_start_utc) if i == 0 else overnight_start_utc
 
             all_day_slots = [
                 s for s in (future_slots if i == 0 else prices)
@@ -395,6 +408,14 @@ class EVChargeCoordinator(DataUpdateCoordinator):
                         f"{((1 - day['avg'] / avg_14day) * 100):.0f}% below the {avg_14day:.1f}p avg). "
                         f"{target_reason} — charging to {charge_to:.0f}%."
                     )
+                elif action == ACTION_ROUTINE:
+                    lookahead_n = assignment.get("routine_lookahead", 3)
+                    reason = (
+                        f"Battery at {battery_at_start:.0f}%, below target. "
+                        f"Tonight ({day['avg']:.1f}p avg) is the cheapest of the next "
+                        f"{lookahead_n} night(s). {target_reason} — charging to {charge_to:.0f}%."
+                    )
+
                 else:  # ACTION_OPPORTUNISTIC
                     lookahead = day_summaries[i + 1 : i + 6]
                     next_avg = statistics.mean(d["avg"] for d in lookahead) if lookahead else avg_14day
@@ -416,7 +437,9 @@ class EVChargeCoordinator(DataUpdateCoordinator):
                         and s["datetime"] not in scheduled_dts
                     ]
 
-                # For opportunistic/full_charge: only use slots below 14-day average
+                # For opportunistic/full_charge: only use slots below 14-day average.
+                # Routine charging uses any slot in the overnight window (no price filter)
+                # so it still works when all slots are above average.
                 if action in (ACTION_OPPORTUNISTIC, ACTION_FULL_CHARGE):
                     cheap_available = [s for s in available if s["price"] < avg_14day]
                     if not cheap_available:
@@ -603,7 +626,7 @@ class EVChargeCoordinator(DataUpdateCoordinator):
                     today_is_cheap
                     and upcoming_expensive
                     and price_ratio >= 1.25
-                    and battery < (target_pct - 5)
+                    and battery < 95.0
                 ):
                     strategic_tgt, tgt_reason = self._strategic_target(
                         day_summaries=day_summaries,
@@ -624,6 +647,50 @@ class EVChargeCoordinator(DataUpdateCoordinator):
                         "triggered_by": i,
                     }
                     battery = strategic_tgt
+
+                elif battery < target_pct - 5:
+                    # Routine recharge: battery has dropped below target.
+                    # Look at tonight and the next 2 nights; charge on the
+                    # cheapest window.  Cap the lookahead by battery safety
+                    # margin so we never wait too long when running low.
+                    if depletion > 0:
+                        max_safe_wait = max(0, math.floor((battery - _SAFETY_PCT) / depletion) - 1)
+                    else:
+                        max_safe_wait = 2
+                    lookahead_n = min(3, max_safe_wait + 1)
+                    routine_window = day_summaries[i : i + lookahead_n]
+                    unassigned = [k for k in range(len(routine_window)) if (i + k) not in assignments]
+
+                    if unassigned:
+                        best_offset = min(unassigned, key=lambda k: routine_window[k]["avg"])
+                        if best_offset == 0:
+                            # Tonight is cheapest in the window — charge now
+                            strategic_tgt, tgt_reason = self._strategic_target(
+                                day_summaries=day_summaries,
+                                from_idx=i,
+                                today_overnight_avg=day["avg"],
+                                user_target_pct=target_pct,
+                                daily_usage=daily_usage,
+                                battery_cap=battery_cap,
+                                avg_14day=avg_14day,
+                                p35=p35,
+                            )
+                            action = ACTION_FULL_CHARGE if day["avg"] <= p15 else ACTION_ROUTINE
+                            assignments[i] = {
+                                "action": action,
+                                "charge_to": strategic_tgt,
+                                "target_reason": tgt_reason,
+                                "cheapest_day_name": day["date"].strftime("%A"),
+                                "triggered_by": i,
+                                "routine_lookahead": lookahead_n,
+                            }
+                            battery = strategic_tgt
+                        else:
+                            # A cheaper night is coming — wait
+                            battery = max(0.0, battery - depletion)
+                    else:
+                        battery = max(0.0, battery - depletion)
+
                 else:
                     battery = max(0.0, battery - depletion)
 
@@ -779,6 +846,13 @@ class EVChargeCoordinator(DataUpdateCoordinator):
                     f"{day['day_min_price']:.1f}p cheapest · "
                     f"{day['charge_hours']:.1f}h"
                 )
+            elif action == ACTION_ROUTINE:
+                icon = "🔋"
+                detail = (
+                    f"{day['charge_slot_times']} · "
+                    f"{day['day_avg_price']:.1f}p avg · "
+                    f"{day['charge_hours']:.1f}h"
+                )
             else:
                 icon = "🔵"
                 detail = (
@@ -867,6 +941,7 @@ def _action_label(action: str) -> str:
     return {
         ACTION_NO_CHARGE: "No charge",
         ACTION_CHARGE: "Charge overnight",
+        ACTION_ROUTINE: "Routine charge",
         ACTION_OPPORTUNISTIC: "Charge (good price)",
         ACTION_FULL_CHARGE: "FULL CHARGE — exceptional value",
     }.get(action, action)
