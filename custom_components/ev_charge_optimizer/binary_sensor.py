@@ -1,6 +1,7 @@
 """Binary sensor platform for EV Charge Optimizer."""
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
 
 from homeassistant.components.binary_sensor import BinarySensorEntity
@@ -13,6 +14,8 @@ from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, DATA_SCHEDULE_SLOTS
 from .coordinator import EVChargeCoordinator
+
+_LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
@@ -27,10 +30,16 @@ async def async_setup_entry(
 class ChargeWindowSensor(CoordinatorEntity[EVChargeCoordinator], BinarySensorEntity):
     """ON during each individual planned 30-min charge slot; OFF otherwise.
 
-    The sensor registers a point-in-time callback at the START and END of every
-    scheduled slot so the state flips at the exact half-hour boundary.
-    Link this directly to your car charger switch — it turns on for cheap slots
-    and off for expensive ones, automatically throughout the week.
+    Design notes
+    ────────────
+    The sensor owns a STABLE copy of the slot list (_own_slots).  This list is
+    only replaced by coordinator updates when the sensor is NOT currently ON.
+    This stops a coordinator refresh mid-session from prematurely ending the
+    charge (which happened because the rising battery level caused the planner
+    to drop the remaining session slots from the schedule).
+
+    Timers fire at the exact start/end boundary of every slot so the state
+    flips at the right half-hour regardless of coordinator poll timing.
     """
 
     _attr_has_entity_name = True
@@ -47,84 +56,143 @@ class ChargeWindowSensor(CoordinatorEntity[EVChargeCoordinator], BinarySensorEnt
             "model": "EV Charge Optimizer",
             "entry_type": "service",
         }
+        self._own_slots: list[dict] = []   # stable copy — only updated when OFF
         self._timer_unsubs: list = []
+
+    # ------------------------------------------------------------------
+    # HA lifecycle
+    # ------------------------------------------------------------------
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
-        self.async_on_remove(
-            self.coordinator.async_add_listener(self._on_coordinator_update)
-        )
+        # Populate slot list immediately from whatever data the coordinator has
+        self._sync_slots_from_coordinator()
         self._reschedule_timers()
 
     async def async_will_remove_from_hass(self) -> None:
         self._cancel_timers()
 
     # ------------------------------------------------------------------
+    # Coordinator updates
+    # ------------------------------------------------------------------
+
+    def _handle_coordinator_update(self) -> None:
+        """Called on every coordinator refresh (overrides CoordinatorEntity default).
+
+        KEY RULE: if a charge session is currently active, do NOT swap the
+        slot list — the rising battery during charging would cause the planner
+        to drop the remaining session slots and turn us OFF prematurely.
+
+        Only reschedule timers when the slot list is actually updated.
+        """
+        now = dt_util.utcnow()
+        currently_on = self._is_on_at(now, self._own_slots)
+
+        if not currently_on:
+            # Safe to update — no active session
+            changed = self._sync_slots_from_coordinator()
+            if changed:
+                self._reschedule_timers()
+
+        self.async_write_ha_state()
+
+    def _sync_slots_from_coordinator(self) -> bool:
+        """Pull latest slots from coordinator data.  Returns True if changed."""
+        new_slots = (
+            self.coordinator.data.get(DATA_SCHEDULE_SLOTS, [])
+            if self.coordinator.data
+            else []
+        )
+        if new_slots != self._own_slots:
+            self._own_slots = list(new_slots)
+            return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Timers
+    # ------------------------------------------------------------------
 
     def _cancel_timers(self) -> None:
         for unsub in self._timer_unsubs:
-            unsub()
+            try:
+                unsub()
+            except Exception:
+                pass
         self._timer_unsubs.clear()
 
     def _reschedule_timers(self) -> None:
-        """Register a callback at the start AND end of every scheduled slot.
+        """Register a callback at the START and END of every upcoming slot.
 
-        Each slot is 30 min. We register two callbacks per slot:
-          - at slot["datetime"]          → sensor turns ON
-          - at slot["datetime"] + 30min  → sensor turns OFF
-        This gives the charger an exact on/off signal at each half-hour boundary.
+        At each boundary we write state, which re-evaluates `is_on` so the
+        sensor flips at the exact half-hour mark regardless of coordinator
+        poll timing.  After the boundary fires we also allow the coordinator's
+        slot list to be refreshed (if the session just ended).
         """
         self._cancel_timers()
-        if not self.coordinator.data:
-            return
-        slots = self.coordinator.data.get(DATA_SCHEDULE_SLOTS, [])
         now = dt_util.utcnow()
         seen: set[datetime] = set()
-        for slot in slots:
-            slot_start = slot["datetime"]
-            slot_end = slot_start + timedelta(minutes=30)
+
+        for slot in self._own_slots:
+            slot_start: datetime = slot["datetime"]
+            slot_end: datetime = slot_start + timedelta(minutes=30)
+
             for boundary in (slot_start, slot_end):
                 if boundary > now and boundary not in seen:
                     seen.add(boundary)
                     self._timer_unsubs.append(
-                        async_track_point_in_time(self.hass, self._boundary_reached, boundary)
+                        async_track_point_in_time(
+                            self.hass, self._boundary_reached, boundary
+                        )
                     )
 
-    def _on_coordinator_update(self) -> None:
-        self._reschedule_timers()
-        self.async_write_ha_state()
-
     def _boundary_reached(self, _now: datetime) -> None:
-        """Called at exact slot boundary — write new state immediately."""
+        """Called at exact slot boundary.
+
+        After each boundary, if the session just ended (is_on → False) we
+        allow the coordinator's fresher slot list in.
+        """
+        now = dt_util.utcnow()
+        if not self._is_on_at(now, self._own_slots):
+            # Session just ended — safe to pull in updated coordinator data
+            self._sync_slots_from_coordinator()
+            self._reschedule_timers()
         self.async_write_ha_state()
 
     # ------------------------------------------------------------------
+    # State
+    # ------------------------------------------------------------------
 
-    @property
-    def is_on(self) -> bool:
-        if not self.coordinator.data:
-            return False
-        slots = self.coordinator.data.get(DATA_SCHEDULE_SLOTS, [])
-        now = dt_util.utcnow()
+    @staticmethod
+    def _is_on_at(now: datetime, slots: list[dict]) -> bool:
         return any(
             s["datetime"] <= now < s["datetime"] + timedelta(minutes=30)
             for s in slots
         )
 
     @property
+    def is_on(self) -> bool:
+        return self._is_on_at(dt_util.utcnow(), self._own_slots)
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator.last_update_success
+
+    @property
     def extra_state_attributes(self) -> dict:
-        if not self.coordinator.data:
-            return {}
-        slots = self.coordinator.data.get(DATA_SCHEDULE_SLOTS, [])
         now = dt_util.utcnow()
         return {
             "scheduled_slots": [
                 {
                     "time": dt_util.as_local(s["datetime"]).strftime("%a %d %b %H:%M"),
                     "price_p_kwh": round(s["price"], 2),
-                    "status": "active" if s["datetime"] <= now < s["datetime"] + timedelta(minutes=30) else "upcoming",
+                    "status": (
+                        "active"
+                        if s["datetime"] <= now < s["datetime"] + timedelta(minutes=30)
+                        else "upcoming"
+                    ),
                 }
-                for s in slots
+                for s in self._own_slots
                 if s["datetime"] + timedelta(minutes=30) > now
-            ]
+            ],
+            "session_locked": self._is_on_at(now, self._own_slots),
         }
