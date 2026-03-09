@@ -261,6 +261,16 @@ class EVChargeCoordinator(DataUpdateCoordinator):
         local_now = dt_util.as_local(now)
         future_slots = [s for s in prices if s["datetime"] > now]
 
+        # Floor now to the nearest 30-min slot boundary.
+        # Prevents the coordinator dropping a slot that started in the same
+        # 30-min window it happens to refresh in (e.g. refreshes at 22:30:01
+        # → slot at 22:30:00 excluded because now > slot_start by 1 second).
+        now_floor = now - timedelta(
+            minutes=now.minute % 30,
+            seconds=now.second,
+            microseconds=now.microsecond,
+        )
+
         if not future_slots or daily_usage <= 0 or charge_rate <= 0:
             return [], []
 
@@ -300,8 +310,10 @@ class EVChargeCoordinator(DataUpdateCoordinator):
             overnight_start_utc = dt_util.as_utc(overnight_start_local)
             overnight_end_utc = dt_util.as_utc(overnight_end_local)
 
-            # For today: start from max(now, 18:00) so we never look backwards
-            effective_overnight_start = max(now, overnight_start_utc) if i == 0 else overnight_start_utc
+            # For today: start from max(now_floor, 18:00).
+            # Using the floored time means a slot at 22:30:00 is never
+            # accidentally dropped when the coordinator refreshes at 22:30:01.
+            effective_overnight_start = max(now_floor, overnight_start_utc) if i == 0 else overnight_start_utc
 
             all_day_slots = [
                 s for s in (future_slots if i == 0 else prices)
