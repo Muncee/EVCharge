@@ -6,6 +6,7 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers.event import async_call_later
 
 from .const import DOMAIN
 from .coordinator import EVChargeCoordinator
@@ -35,14 +36,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await coordinator.async_config_entry_first_refresh()
     except ConfigEntryNotReady as err:
         # API was unreachable at startup (common right after HA boot).
-        # Log it but don't abort — the coordinator will retry on its interval.
-        # Sensors will be 'unavailable' until the first successful poll.
+        # Schedule a retry in 5 minutes rather than waiting the full update
+        # interval (30 min), so data appears quickly once the network is up.
         _LOGGER.warning(
             "EV Charge Optimizer: initial price fetch failed (%s). "
-            "Sensors will be unavailable until the next scheduled refresh. "
-            "No action needed — the integration will recover automatically.",
+            "Will retry in 5 minutes — no action needed.",
             err,
         )
+
+        async def _retry_fetch(_now=None) -> None:
+            await coordinator.async_refresh()
+
+        entry.async_on_unload(async_call_later(hass, 5 * 60, _retry_fetch))
         # Don't re-raise: complete setup so entities register and users can
         # see 'unavailable' state rather than a broken integration card.
 
