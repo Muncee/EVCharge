@@ -614,7 +614,7 @@ class EVChargeCoordinator(DataUpdateCoordinator):
                     today_is_cheap
                     and upcoming_expensive
                     and price_ratio >= 1.25
-                    and battery < (target_pct - 5)
+                    and battery < 95.0
                 ):
                     strategic_tgt, tgt_reason = self._strategic_target(
                         day_summaries=day_summaries,
