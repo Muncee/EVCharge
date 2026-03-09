@@ -13,7 +13,7 @@ CONF_BATTERY_ENTITY = "battery_entity"
 # API
 API_BASE_URL = "https://agilepredict.com/api"
 API_DAYS = 14
-UPDATE_INTERVAL_MINUTES = 60
+UPDATE_INTERVAL_MINUTES = 30
 
 # Octopus Agile DNO regions
 OCTOPUS_REGIONS = {
